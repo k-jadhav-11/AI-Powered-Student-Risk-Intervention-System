@@ -1,0 +1,9 @@
+{
+  "test_precision_at_risk": 0.9578,
+  "test_recall_at_risk": 0.8263,
+  "test_f1_at_risk": 0.8872,
+  "test_roc_auc": 0.936,
+  "epochs": 30,
+  "hidden_size": 32,
+  "max_weeks": 40
+}

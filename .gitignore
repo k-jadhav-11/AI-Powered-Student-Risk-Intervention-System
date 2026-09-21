@@ -1,0 +1,34 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- Virtual environment ----
+venv/
+env/
+.venv/
+
+# ---- Secrets ----
+.env
+.env.local
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- CatBoost training logs (auto-generated every training run) ----
+catboost_info/
+
+# ---- Exported reports (regenerated on demand from the app/CLI) ----
+reports/*.csv
+reports/*.png
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+
+
+
+
+data/*

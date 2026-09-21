@@ -1,0 +1,20 @@
+EngagementGRU -- architecture and configuration summary
+=======================================================
+
+input_size:   2
+hidden_size:  32
+num_layers:   1
+max_weeks:    40
+feature_cols: ['total_clicks', 'days_active']
+log1p_clicks: True
+total trainable parameters: 4,001
+
+EngagementGRU(
+  (gru): GRU(2, 32, batch_first=True)
+  (head): Sequential(
+    (0): Linear(in_features=32, out_features=16, bias=True)
+    (1): ReLU()
+    (2): Linear(in_features=16, out_features=1, bias=True)
+    (3): Sigmoid()
+  )
+)
