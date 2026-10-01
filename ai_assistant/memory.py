@@ -1,20 +1,7 @@
 # ai_assistant/memory.py
-
 """
-Sprint 4 -- chat memory (Section 5.2 of the plan).
-
-Scoped to a Streamlit session (st.session_state), not persisted to a
-database -- persistent, multi-session chat history is a later-sprint
-concern once a persistence layer is actually in the stack, consistent with
-how Sprint 3 itself avoided adding infrastructure (like MLflow) that the
-sprint didn't strictly need.
-
-API note: the original plan named `ConversationBufferMemory`
-(`langchain.memory`), which no longer exists in current LangChain -- 
-`langchain.memory` and the standalone Memory classes were removed in favor
-of composing `Runnable`s with `langchain_core.chat_history`. This module
-uses `InMemoryChatMessageHistory`, which is that class's direct successor
-for a simple "keep every turn" buffer -- same behavior, current API.
+Manage in-memory chat history for the current Streamlit session.
+Optionally persist and restore chat history using the database layer.
 """
 
 
@@ -118,3 +105,120 @@ def clear(
 
     # Remove the conversation history from session state
     session_state.pop(key, None)
+
+
+# ============================================================
+# Normalize Message Content to Text
+# ============================================================
+
+def _as_text(content) -> str:
+    """
+    Return message content as a plain string.
+    Some providers (e.g. Gemini) return a list of content blocks instead of
+    a str; a list cannot be stored in ChatMessage.content, so flatten it to
+    its text using the same helper the streaming path already relies on.
+    """
+
+    # Already plain text -- nothing to do
+    if isinstance(content, str):
+        return content
+
+    # Imported lazily to avoid any import cycle with llm_client
+    from ai_assistant import llm_client
+    return llm_client._extract_chunk_text(content)
+
+
+# ============================================================
+# Save Conversation Turn to Database
+# ============================================================
+
+def save_turn_to_db(
+    teacher_id: str,
+    session_key: str,
+    question: str,
+    answer: str,
+) -> None:
+    """
+    Persist one chat turn to the database for session-based history.
+    Uses best-effort persistence so database failures do not interrupt chat.
+    The identifier is not an authenticated teacher identity.
+    """
+
+    # Skip persistence entirely when no identifier was supplied
+    if not teacher_id:
+        return
+
+    # Guard against list-of-blocks content (see _as_text)
+    question = _as_text(question)
+    answer = _as_text(answer)
+
+    try:
+        from backend.database import get_session
+        from backend.models_db import ChatMessage
+
+        # Open a database session and store both sides of the turn
+        with get_session() as session:
+            session.add(ChatMessage(teacher_id=teacher_id, session_key=session_key, role="human", content=question))
+            session.add(ChatMessage(teacher_id=teacher_id, session_key=session_key, role="ai", content=answer))
+            session.commit()
+    except Exception as e:
+        # Log the failure but let the conversation continue uninterrupted
+        import logging
+        logging.getLogger(__name__).error(
+            "Failed to persist chat turn for teacher_id=%r: %s", teacher_id, e, exc_info=True
+        )
+
+
+# ============================================================
+# Load Conversation History from Database
+# ============================================================
+
+def load_history_into_session(
+    session_state: dict,
+    teacher_id: str,
+    session_key: str,
+    limit: int = 40,
+) -> None:
+    """
+    Restore saved chat turns into the current session history.
+    Loads each teacher/session history only once per Streamlit session.
+    """
+
+    # Skip when no identifier was supplied, or history was already loaded once
+    loaded_flag = f"_loaded_{session_key}_{teacher_id}"
+    if not teacher_id or session_state.get(loaded_flag):
+        return
+    session_state[loaded_flag] = True
+
+    try:
+        from backend.database import get_session
+        from backend.models_db import ChatMessage
+
+        # Read this teacher's saved turns for this chat, oldest first
+        with get_session() as session:
+            rows = (
+                session.query(ChatMessage)
+                .filter(ChatMessage.teacher_id == teacher_id, ChatMessage.session_key == session_key)
+                .order_by(ChatMessage.created_at.asc())
+                .limit(limit)
+                .all()
+            )
+    except Exception as e:
+        # Log the failure and leave session history empty rather than raising
+        import logging
+        logging.getLogger(__name__).error(
+            "Failed to load chat history for teacher_id=%r: %s", teacher_id, e, exc_info=True
+        )
+        return
+
+    # Nothing saved yet for this teacher -- leave history empty
+    if not rows:
+        return
+
+    # Replay each saved row back into the in-memory history
+    history = get_session_history(session_state, session_key)
+    for row in rows:
+        if row.role == "human":
+            history.add_user_message(row.content)
+        else:
+            history.add_ai_message(row.content)

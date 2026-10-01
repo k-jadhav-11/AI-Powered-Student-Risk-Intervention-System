@@ -3,7 +3,7 @@
 import contextvars
 from typing import Iterator
 from langsmith import traceable, trace
-from src.analytics.exceptions import StudentNotFoundError
+from src.analytics.exceptions import DataNotFoundError, StudentNotFoundError
 from . import llm_client, memory
 from . import tools as ai_tools
 from .prompts import AGENT_SYSTEM_PROMPT, CHART_IMAGE_ANALYSIS_ADDENDUM
@@ -127,9 +127,49 @@ def build_tools() -> list:
         except StudentNotFoundError as e:
             return {"error": str(e)}
 
+    @tool
+    def run_intervention_agent(
+        dataset: str,
+        student_id: str,
+    ) -> dict:
+        """
+        Run an intervention for a student's current risk.
+        Routes the student to a nudge, resource, or mentor escalation and logs the decision.
+        
+        """
+        # Import intervention modules only when the tool is called.
+        from orchestration import audit as intervention_audit
+        from orchestration import graph as intervention_graph
+
+        try:
+            risk_explanation = ai_tools.get_risk_explanation(
+                dataset,
+                student_id,
+            )
+        except (
+            StudentNotFoundError,
+            DataNotFoundError,
+            ValueError,
+        ) as e:
+            return {"error": str(e)}
+
+        decision = intervention_graph.run_intervention(
+            dataset,
+            student_id,
+            risk_explanation,
+        )
+
+        intervention_audit.log_decision(
+            decision,
+            run_id=f"chat:{dataset}:{student_id}",
+        )
+
+        return decision
+
     return [
         get_student_risk, get_student_shap, get_model_information, search_interventions,
         get_cohort_summary, get_student_engagement, get_student_gru_explanation, get_gru_context,
+        run_intervention_agent,
     ]
 
 
@@ -164,28 +204,34 @@ def _looks_like_chart_question(question: str) -> bool:
 
 
 def _build_message_history(session_state: dict, session_key: str, question: str, system_prompt: str,
-                            chart_image_b64: str | None = None) -> tuple[list, bool]:
-    """Build agent messages from system prompt, history, and the new question.
-    Attaches the chart image only when the question explicitly refers to a visual.
-    Returns the messages and whether an image was attached.
-    """
+                            chart_image_b64: str | None = None,
+                            chart_gallery: dict[str, str] | None = None,
+                            page_context: str | None = None) -> tuple[list, bool]:
+    """Build agent messages from the system prompt, chat history, and new question.
+    Attach relevant chart images only when the question explicitly refers to a visual.
+    Include the current page context so references such as "this student" remain grounded."""
+
     from langchain_core.messages import HumanMessage, SystemMessage
 
     history = memory.get_session_history(session_state, session_key)
 
-    attach_image = bool(chart_image_b64) and _looks_like_chart_question(question)
+    images = chart_gallery if chart_gallery else ({"chart": chart_image_b64} if chart_image_b64 else {})
+    attach_image = bool(images) and _looks_like_chart_question(question)
     effective_system_prompt = system_prompt + CHART_IMAGE_ANALYSIS_ADDENDUM if attach_image else system_prompt
 
     messages = [SystemMessage(content=effective_system_prompt)]
     messages.extend(history.messages)
 
+    question_text = f"({page_context})\n\n{question}" if page_context else question
+
     if attach_image:
-        messages.append(HumanMessage(content=[
-            {"type": "text", "text": question},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{chart_image_b64}"}},
-        ]))
+        labels = ", ".join(images.keys())
+        content = [{"type": "text", "text": f"{question_text}\n\n(Charts currently visible: {labels}.)"}]
+        for b64 in images.values():
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+        messages.append(HumanMessage(content=content))
     else:
-        messages.append(HumanMessage(content=question))
+        messages.append(HumanMessage(content=question_text))
     return messages, attach_image
 
 
@@ -197,9 +243,11 @@ def _call_agent_llm(model_with_tools, messages: list):
     """
     return model_with_tools.invoke(messages)
 
-
+# Run the agent implementation (non-streaming) and return its result.
 def _run_agent_impl(question: str, session_state: dict, session_key: str,
-                    provider: str | None = None, chart_image_b64: str | None = None) -> dict:
+                    provider: str | None = None, chart_image_b64: str | None = None,
+                    chart_gallery: dict[str, str] | None = None,
+                    page_context: str | None = None) -> dict:
     """Run the non-streaming agent implementation."""
     from langchain_core.messages import ToolMessage
 
@@ -216,12 +264,15 @@ def _run_agent_impl(question: str, session_state: dict, session_key: str,
         )
         return {"answer": answer, "source": "unconfigured", "artifacts": artifacts,
                 "tool_calls_made": tool_calls_made, "chart_image_attached": False}
-
+    
+    # Trace the agent setup and tool/model retrieval, including building the message history.
     with trace(name="Agent Setup", run_type="chain") as setup_run:
         model, model_with_tools, tools_list = _get_cached_model_and_tools(provider)
         tools_by_name = {t.name: t for t in tools_list}
         messages, image_attached = _build_message_history(session_state, session_key, question, AGENT_SYSTEM_PROMPT,
-                                                            chart_image_b64=chart_image_b64)
+                                                            chart_image_b64=chart_image_b64,
+                                                            chart_gallery=chart_gallery,
+                                                            page_context=page_context)
         setup_run.end(outputs={"tool_count": len(tools_list), "image_attached": image_attached})
 
     try:
@@ -230,7 +281,8 @@ def _run_agent_impl(question: str, session_state: dict, session_key: str,
             messages.append(response)
 
             if not response.tool_calls:
-                answer = response.content
+               # Normalize provider-specific content to plain text for API and database compatibility.
+                answer = llm_client._extract_chunk_text(response.content)
                 memory.add_turn(session_state, question, answer, session_key)
                 return {"answer": answer, "source": "llm", "artifacts": artifacts,
                         "tool_calls_made": tool_calls_made, "chart_image_attached": image_attached}
@@ -253,9 +305,11 @@ def _run_agent_impl(question: str, session_state: dict, session_key: str,
     finally:
         _current_artifacts.reset(artifacts_token)
 
-
+# Run the agent and return its result, tracing the entire process.
 def run_agent(question: str, session_state: dict, session_key: str = "ai_agent_chat",
-              provider: str | None = None, chart_image_b64: str | None = None) -> dict:
+              provider: str | None = None, chart_image_b64: str | None = None,
+              chart_gallery: dict[str, str] | None = None,
+              page_context: str | None = None) -> dict:
     """Run the AI agent and return its result."""
     with trace(
         name="AI Student Risk Assistant",
@@ -268,6 +322,8 @@ def run_agent(question: str, session_state: dict, session_key: str = "ai_agent_c
             session_key,
             provider,
             chart_image_b64=chart_image_b64,
+            chart_gallery=chart_gallery,
+            page_context=page_context,
         )
         trace_run.end(outputs={"answer": result["answer"], "tools_used": result["tool_calls_made"]})
         return result
@@ -288,7 +344,9 @@ class _StreamResult:
 
 def _run_agent_stream_impl(question: str, session_state: dict, result: _StreamResult,
                            session_key: str, provider: str | None = None,
-                           chart_image_b64: str | None = None) -> Iterator[str]:
+                           chart_image_b64: str | None = None,
+                           chart_gallery: dict[str, str] | None = None,
+                           page_context: str | None = None) -> Iterator[str]:
     """Run the agent and stream generated text."""
     from langchain_core.messages import ToolMessage
 
@@ -306,7 +364,9 @@ def _run_agent_stream_impl(question: str, session_state: dict, result: _StreamRe
         model, model_with_tools, tools_list = _get_cached_model_and_tools(provider)
         tools_by_name = {t.name: t for t in tools_list}
         messages, image_attached = _build_message_history(session_state, session_key, question, AGENT_SYSTEM_PROMPT,
-                                                            chart_image_b64=chart_image_b64)
+                                                            chart_image_b64=chart_image_b64,
+                                                            chart_gallery=chart_gallery,
+                                                            page_context=page_context)
         result.chart_image_attached = image_attached
         setup_run.end(outputs={"tool_count": len(tools_list), "image_attached": image_attached})
 
@@ -346,7 +406,9 @@ def _run_agent_stream_impl(question: str, session_state: dict, result: _StreamRe
 
 def run_agent_stream_with_artifacts(question: str, session_state: dict, result: _StreamResult,
                                      session_key: str = "ai_agent_chat", provider: str | None = None,
-                                     chart_image_b64: str | None = None) -> Iterator[str]:
+                                     chart_image_b64: str | None = None,
+                                     chart_gallery: dict[str, str] | None = None,
+                                     page_context: str | None = None) -> Iterator[str]:
     """Run the agent and stream its response."""
     with trace(
         name="AI Student Risk Assistant",
@@ -362,6 +424,8 @@ def run_agent_stream_with_artifacts(question: str, session_state: dict, result: 
                 session_key,
                 provider,
                 chart_image_b64=chart_image_b64,
+                chart_gallery=chart_gallery,
+                page_context=page_context,
             ):
                 full_answer.append(chunk)
                 yield chunk

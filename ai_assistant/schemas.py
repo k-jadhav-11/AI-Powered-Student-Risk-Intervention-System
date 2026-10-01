@@ -153,3 +153,36 @@ class CohortQuestion(BaseModel):
     dataset: Literal["uci", "oulad"]
     risk_level: Literal["Low", "Medium", "High"] | None = None
     limit: int = Field(default=10, ge=1, le=100)
+
+# ============================================================
+# Intervention Decision Schema
+# ============================================================
+
+class InterventionDecision(BaseModel):
+    """
+    Stores the structured decision returned by the Sprint 5 intervention agent.
+    Tracks the selected action, rationale, message/resources, and escalation details.
+    """
+
+    student_id: str
+    display_student_id: str | None = None
+
+    dataset: Literal["uci", "oulad"]
+    risk_level: Literal["Low", "Medium", "High"]
+
+    decision: Literal["nudge", "resource", "escalate"]
+    rationale: str
+
+    drafted_message: str | None = None
+    resources_used: list[str] = Field(default_factory=list)
+
+    escalation_reason: str | None = None
+
+    router_confidence: float = Field(ge=0.0, le=1.0)
+    oulad_id_student: int | None = None
+
+    agent_trace: list[str] = Field(default_factory=list)
+    source: Literal["crew", "template"]
+
+    # Markdown briefing for the human reviewer; only set for escalations.
+    mentor_brief: str | None = None

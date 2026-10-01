@@ -44,29 +44,126 @@ from .schemas import (
 # ============================================================
 
 def _resolve_row_index(dataset: str, student_id: str) -> int:
-    """Shared validation for every row-index tool below. Natural-language
-    numbering is 1-based (the first student is '1', not '0') -- this is the
-    one place that converts it to the 0-based pandas index every lookup
-    actually uses."""
+    """Validates a dataset and resolves a 1-based student ID to a row index.
+    Raises StudentNotFoundError when the student cannot be resolved."""
     if dataset not in ("uci", "oulad"):
-        raise ValueError(f"dataset must be 'uci' or 'oulad', got {dataset!r}")
+        raise ValueError(
+            f"dataset must be 'uci' or 'oulad', got {dataset!r}"
+        )
+
     try:
         display_num = int(student_id)
     except (TypeError, ValueError):
         raise StudentNotFoundError(
-            f"'{student_id}' isn't a valid student_id for {dataset} -- expected the row "
-            f"number shown on the Risk Dashboard — {dataset.upper()} page, starting at 1 (e.g. '43')."
+            f"'{student_id}' isn't a valid student_id for {dataset} -- expected "
+            f"the row number shown on the Risk Dashboard — {dataset.upper()} page, "
+            f"starting at 1 (e.g. '43')."
         )
+
     idx = display_num - 1
     risk_df = risk_queries.load_risk_scores(dataset)
+
     if idx not in risk_df.index:
         raise StudentNotFoundError(
             f"student {display_num} not found in {dataset} risk scores "
             f"(valid range: 1-{risk_df.index.max() + 1})."
         )
+
     return idx
 
 
+def resolve_student_id_from_row_index(
+    dataset: str,
+    row_index: int,
+) -> str:
+    """Resolves a user-facing 1-based row index to the student's display ID.
+    Supports datasets where the real student ID differs from the row number."""
+    if dataset not in ("uci", "oulad"):
+        raise ValueError(
+            f"Unsupported dataset: {dataset}"
+        )
+
+    try:
+        display_num = int(row_index)
+    except (TypeError, ValueError):
+        raise StudentNotFoundError(
+            f"Invalid row index: {row_index}"
+        )
+
+    if display_num < 1:
+        raise StudentNotFoundError(
+            f"Row index must be >= 1. Got: {display_num}"
+        )
+
+    idx = display_num - 1
+    risk_df = risk_queries.load_risk_scores(dataset)
+
+    if idx not in risk_df.index:
+        raise StudentNotFoundError(
+            f"Student row index {display_num} not found in {dataset} dataset."
+        )
+
+    row = risk_df.loc[idx]
+
+    return _display_student_id(
+        dataset,
+        idx,
+        row,
+    )
+
+
+def resolve_row_index_from_student_id(
+    dataset: str,
+    student_id: str,
+) -> int:
+    """Resolves a real student ID to its internal dataframe row index.
+    Supports both real and display student ID columns."""
+    if dataset not in ("uci", "oulad"):
+        raise ValueError(
+            f"Unsupported dataset: {dataset}"
+        )
+
+    target = str(student_id).strip()
+
+    if not target:
+        raise StudentNotFoundError(
+            "Student ID cannot be empty."
+        )
+
+    risk_df = risk_queries.load_risk_scores(dataset)
+
+    for col in ("id_student", "display_student_id"):
+        if col not in risk_df.columns:
+            continue
+
+        series = risk_df[col]
+
+        try:
+            numeric_target = int(target)
+        except (TypeError, ValueError):
+            numeric_target = None
+
+        if (
+            numeric_target is not None
+            and pd.api.types.is_numeric_dtype(series)
+        ):
+            matches = series == numeric_target
+        else:
+            matches = (
+                series.astype(str).str.strip() == target
+            )
+
+        if matches.any():
+            matching_indexes = risk_df.index[matches]
+
+            if len(matching_indexes) > 0:
+                return int(matching_indexes[0])
+
+    raise StudentNotFoundError(
+        f"Student ID '{student_id}' not found in {dataset} dataset."
+    )
+
+    
 # ============================================================
 # Display Student ID Helper
 # ============================================================

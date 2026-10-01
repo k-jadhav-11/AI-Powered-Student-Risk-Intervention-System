@@ -12,6 +12,7 @@ Run with:
 """
 import base64
 import io
+import json
 import os
 
 import numpy as np
@@ -21,12 +22,125 @@ import streamlit as st
 from src.analytics import db_manager, queries, analytics, charts
 from src.analytics.exceptions import InvalidCSVError, DataNotFoundError, StudentNotFoundError
 from src import risk as rs
+from src.risk import risk_queries
 from ai_assistant import memory as genai_memory, llm_client, agent, rag as ai_rag
+from ai_assistant import tools as ai_tools
+from orchestration import audit as intervention_audit
+from orchestration import dashboard_charts as intervention_charts
+from orchestration import graph as intervention_graph
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 REPORTS_DIR = os.path.join(os.path.dirname(__file__), "reports")
 
 st.set_page_config(page_title="Student Performance Analytics", layout="wide")
+
+# --------------------------------------------------------------- visual polish
+# One shared stylesheet, injected once per run, so every Sprint 2-5 page
+# inherits the same spacing/card/badge treatment instead of each page
+# hand-rolling its own st.markdown(unsafe_allow_html=True) snippets. Pure
+# CSS only -- no page's Python logic changes, so this is safe to add
+# without touching any page function's behavior, including the newer
+# _render_embedded_chat_expander()/_render_intervention_chat_panel() split.
+_CUSTOM_CSS = """
+<style>
+/* Tighter vertical rhythm -- Streamlit's default block spacing reads as
+   very loose once a page has more than 4-5 stacked sections. */
+div.block-container { padding-top: 2rem; padding-bottom: 3rem; }
+div[data-testid="stVerticalBlock"] > div { margin-bottom: 0.15rem; }
+
+/* Metrics as elevated cards instead of bare numbers -- used heavily on
+   the Teacher Dashboard and the single-student risk lookup. */
+div[data-testid="stMetric"] {
+    background: var(--secondary-background-color);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 0.9rem 1rem 0.7rem 1rem;
+}
+div[data-testid="stMetricLabel"] { opacity: 0.75; }
+
+/* Expanders ("Example messages", "Full decision detail", and the new
+   embedded "Ask the Intervention Agent about this page" panel) as
+   bordered cards matching the metric/dataframe language below, instead
+   of Streamlit's near-invisible default expander. */
+div[data-testid="stExpander"] {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+}
+
+/* Sidebar: a visible divider under the branding block, and a touch more
+   breathing room around the module/report radios. */
+section[data-testid="stSidebar"] div.block-container { padding-top: 1.5rem; }
+section[data-testid="stSidebar"] hr { margin: 0.6rem 0 1rem 0; }
+
+/* Buttons: rounded to match the card language above; subtle lift on
+   hover so primary actions ("Run Intervention Agent", "Run batch")
+   read as clearly clickable. */
+div.stButton > button, div.stDownloadButton > button {
+    border-radius: 8px;
+    transition: transform 0.05s ease-in-out;
+}
+div.stButton > button:hover, div.stDownloadButton > button:hover { transform: translateY(-1px); }
+
+/* Dataframes/tables: rounded container so they match the card language
+   instead of sitting as a hard-edged rectangle. */
+div[data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+
+/* Decision pills (nudge / resource / escalate) -- see _decision_pill_html
+   below. Colors intentionally match the emoji they replace so anyone
+   used to the old 🟢/🟡/🔴 badges reads these the same way at a glance. */
+.decision-pill {
+    display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px;
+    font-weight: 600; font-size: 0.95rem; letter-spacing: 0.01em;
+}
+.decision-pill.nudge     { background: rgba(46, 204, 113, 0.16); color: #2ECC71; }
+.decision-pill.resource  { background: rgba(243, 156, 18, 0.16); color: #F39C12; }
+.decision-pill.escalate  { background: rgba(231, 76, 60, 0.16);  color: #E74C3C; }
+
+/* Chat bubbles: a little extra padding so multi-paragraph answers don't
+   feel cramped against the bubble edge -- matters more now that chat
+   also renders inside the narrower embedded expander panels. */
+div[data-testid="stChatMessage"] { padding: 0.3rem 0.4rem; }
+
+/* Independent scrolling for the Single Student / Cohort Batch / Teacher
+   Dashboard pages' layout -- st.columns() alone shares ONE page-level
+   scrollbar, so a long chat thread on the right pushed the whole page
+   (including the main column) down with it. Scoped to just these two
+   containers (via st.container(key=...), NOT a blanket
+   `div[data-testid="column"]` rule) so ordinary st.columns() usage
+   elsewhere -- the metric rows, the dataset/decision filter row, the
+   cohort nav buttons -- is completely unaffected.
+   min-height: 0 is the actual fix, not height/overflow alone: these
+   containers are flex ITEMS (Streamlit lays out column content with
+   flexbox), and a flex item's default min-height is "auto", which means
+   it refuses to shrink below its own content size no matter what height
+   or overflow you set on it -- the classic reason "I set overflow-y:auto
+   but nothing scrolls, it just grows the whole page instead" happens.
+   Forcing min-height: 0 lets the box actually respect its height and
+   scroll internally instead. !important because Streamlit's own
+   generated styles on these elements otherwise win the specificity tie. */
+.st-key-ia_main_col, .st-key-ia_chat_col {
+    height: calc(100vh - 7rem) !important;
+    max-height: calc(100vh - 7rem) !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    padding-right: 0.75rem;
+    scrollbar-gutter: stable;
+}
+/* The column div wrapping each keyed container also needs min-height: 0
+   for the same flexbox reason -- otherwise the fix above is undone one
+   level up the tree. :has() scopes this to only the two columns that
+   actually contain our keyed containers, same as everything above. */
+div[data-testid="column"]:has(> div > .st-key-ia_main_col),
+div[data-testid="column"]:has(> div > .st-key-ia_chat_col) {
+    min-height: 0 !important;
+}
+</style>
+"""
+
+
+def _inject_custom_css():
+    st.markdown(_CUSTOM_CSS, unsafe_allow_html=True)
+
 
 # --------------------------------------------------------------- connection
 # A single MySQL connection is cached for the session (st.cache_resource),
@@ -1185,22 +1299,730 @@ SPRINT4_PAGES = {
 }
 
 
+# ============================================================
+# Sprint 5 — Intervention Agent (LangGraph + CrewAI + FastAPI/PostgreSQL)
+# ============================================================
+
+def _decision_badge(decision: str) -> str:
+    """Plain-text form -- kept as-is because expander titles can't render
+    HTML, so this stays the fallback for those spots."""
+    return {"nudge": "🟢 Nudge", "resource": "🟡 Resource", "escalate": "🔴 Escalate"}.get(decision, decision)
+
+
+def _decision_pill_html(decision: str) -> str:
+    """Styled pill form (.decision-pill CSS above) for spots that CAN
+    render HTML, e.g. _render_decision's header -- same three colors as
+    _decision_badge's emoji so both forms read as the same signal."""
+    label = {"nudge": "Nudge", "resource": "Resource", "escalate": "Escalate"}.get(decision, decision)
+    css_class = decision if decision in ("nudge", "resource", "escalate") else ""
+    return f'<span class="decision-pill {css_class}">{label}</span>'
+
+
+def _storage_backend_caption():
+    """Surfaces which storage backend is actually active (real
+    PostgreSQL vs. the SQLite/JSONL fallback) -- same "never pretend a
+    fallback is the primary path" convention as _provider_status_caption()
+    already uses for the LLM provider above."""
+    try:
+        backend_label = intervention_audit.get_storage_backend_label()
+        st.caption(f"Audit storage: {backend_label}")
+    except Exception:
+        st.caption("Audit storage: logs/interventions.jsonl (database unavailable)")
+
+
+def _show_and_cache_chart(label: str, fig):
+    """Renders a matplotlib figure AND stashes it as a base64 PNG in
+    st.session_state["ia_chart_gallery"], keyed by a human-readable
+    label. This is the Sprint 5 equivalent of page_ai_assistant's single
+    cached GRU chart (chart_image_key above) -- except several Sprint 5
+    charts can be on screen across different pages in one session (a
+    student's SHAP factors, a confidence gauge, the Teacher Dashboard's
+    four diagrams), so this keeps a small gallery instead of one slot.
+    The Intervention Agent Chat page reads this gallery and sends every
+    chart in it to the multimodal model together when a question looks
+    chart-related (ai_assistant.agent._build_message_history's
+    chart_gallery parameter) -- the actual images the teacher is looking
+    at, not a text description of what's in them."""
+    st.pyplot(fig)
+    png_buf = io.BytesIO()
+    fig.savefig(png_buf, format="png", dpi=120, bbox_inches="tight")
+    gallery = st.session_state.setdefault("ia_chart_gallery", {})
+    gallery[label] = base64.b64encode(png_buf.getvalue()).decode("ascii")
+
+
+def _render_agent_trace(decision: dict):
+    """A visual step-by-step trace of what the graph actually did for
+    this decision, in order -- 'classify' always runs; the node name
+    after it is the routing outcome; a drafting step is shown only for
+    nudge/resource (escalate never calls one, by design); a logging step
+    is always last. This replaces a single 'Agent trace: a → b' caption
+    with something that reads as a pipeline, not a chat reply."""
+    node_labels = {
+        "classify": ("🔎", "Classify"),
+        "nudge_node": ("🟢", "Nudge"),
+        "resource_node": ("🟡", "Resource"),
+        "escalate_node": ("🔴", "Escalate"),
+    }
+    steps = [node_labels.get(n, ("•", n)) for n in decision["agent_trace"]]
+    if decision["decision"] != "escalate":
+        draft_icon = "🤖" if decision["source"] == "crew" else "📄"
+        steps.append((draft_icon, f"Draft ({decision['source']})"))
+    steps.append(("💾", "Logged"))
+
+    cols = st.columns(len(steps) * 2 - 1)
+    for i, (icon, label) in enumerate(steps):
+        with cols[i * 2]:
+            st.markdown(f"<div style='text-align:center'>{icon}<br><small>{label}</small></div>", unsafe_allow_html=True)
+        if i * 2 + 1 < len(cols):
+            with cols[i * 2 + 1]:
+                st.markdown("<div style='text-align:center; padding-top:0.4rem'>→</div>", unsafe_allow_html=True)
+
+
+def _render_resource_badge(resource_str: str):
+    """Parses the '<text> (source: rem_XXX, <match_type>)' format
+    resource_node encodes into resources_used, and renders the match
+    type as a colored badge -- so an exact factor-tag match and an
+    embedding-similarity re-rank don't look identical, per Section 5.2's
+    distinction between the two retrieval paths."""
+    if "(source: " in resource_str and resource_str.endswith(")"):
+        text, meta = resource_str.rsplit("(source: ", 1)
+        meta = meta[:-1] if meta.endswith(")") else meta  # strip exactly one trailing paren
+        parts = [p.strip() for p in meta.split(",")]
+        source_id = parts[0] if parts else "?"
+        match_type = parts[1] if len(parts) > 1 else ""
+    else:
+        text, source_id, match_type = resource_str, "?", ""
+
+    badge_color = "green" if "exact" in match_type else ("orange" if "re-ranked" in match_type else "gray")
+    st.markdown(f"- {text.strip()}  \n  :{badge_color}[{match_type or 'n/a'}] · `{source_id}`")
+
+
+def _render_decision(decision: dict):
+    st.markdown(f"### {_decision_pill_html(decision['decision'])}", unsafe_allow_html=True)
+    if decision.get("display_student_id"):
+        st.caption(f"Student: **{decision['display_student_id']}**")
+    _render_agent_trace(decision)
+
+    gauge_col, rationale_col = st.columns([1, 1.4])
+    with gauge_col:
+        student_label = decision.get("display_student_id") or decision.get("student_id", "?")
+        gauge_fig = intervention_charts.plot_confidence_gauge(decision["router_confidence"], intervention_graph.CONFIDENCE_FLOOR)
+        _show_and_cache_chart(f"Router confidence — student {student_label} ({decision['decision']})", gauge_fig)
+    with rationale_col:
+        st.markdown("**Why this decision:**")
+        st.write(decision["rationale"])
+
+    if decision["decision"] == "escalate":
+        st.error(
+            f"🚨 **Human intervention needed.** No automated nudge or resource message was "
+            f"sent to this student. Reason: {decision['escalation_reason']}."
+        )
+        if decision.get("mentor_brief"):
+            st.markdown("**Briefing for the mentor:**")
+            with st.container(border=True):
+                st.markdown(decision["mentor_brief"])
+        else:
+            st.caption(
+                "This is by design, not a missing feature — a disagreeing model pair or a "
+                "borderline router-confidence score routes here instead of guessing which "
+                "automated message would fit. Recommended next step: a human mentor reviews "
+                "this student directly, using the risk data above."
+            )
+    else:
+        st.markdown("**Drafted message:**")
+        st.info(decision["drafted_message"])
+        if decision["resources_used"]:
+            st.markdown("**Resources used:**")
+            for res in decision["resources_used"]:
+                _render_resource_badge(res)
+
+
+def _resolve_student_lookup(dataset: str, id_mode: str, raw_value: str) -> str:
+    """Turns whatever the teacher typed into the 1-based row-index string
+    every ai_assistant.tools function actually expects -- without
+    modifying tools.py itself (Sprint 4, read-only). Two modes, because
+    forcing "row-index only" was the actual source of the ID confusion
+    reported: a teacher with a school roster naturally has the real
+    student ID (e.g. OULAD's 628653, or UCI's "UCI-0091") on hand far
+    more often than an arbitrary row position, and the two number
+    formats look deceptively similar, so it's easy to type a real ID
+    into a field that silently means something else.
+
+    "Row-index": unchanged, passed straight through.
+    "Real Student ID": reverse-looked-up against risk_queries directly
+    -- for OULAD, against the risk table's own real id_student column
+    (the exact same column _display_student_id() already reads to show
+    "Confirmed: 628653" after a row-index lookup -- so typing 628653
+    back in here now resolves to the same row); for UCI, against
+    display_student_id (e.g. "UCI-0091", case/format-insensitive).
+    """
+    if id_mode == "Row-index":
+        return raw_value
+
+    risk_df = risk_queries.load_risk_scores(dataset)
+    if dataset == "oulad":
+        try:
+            target = int(raw_value)
+        except (TypeError, ValueError):
+            raise StudentNotFoundError(f"'{raw_value}' isn't a valid OULAD id_student -- expected a number like 628653.")
+        matches = risk_df.index[risk_df["id_student"] == target]
+    else:
+        normalized = raw_value.strip().upper()
+        if not normalized.startswith("UCI-"):
+            normalized = f"UCI-{normalized.zfill(4)}"
+        matches = risk_df.index[risk_df["display_student_id"].str.upper() == normalized]
+
+    if len(matches) == 0:
+        raise StudentNotFoundError(f"No {dataset.upper()} student found with real ID '{raw_value}'.")
+    return str(matches[0] + 1)  # back to 1-based, same convention _resolve_row_index() uses
+
+
+def page_intervention_agent_student(conn):
+    with _render_chat_toggle_and_columns():
+        st.header("Intervention Agent — Single Student")
+        st.caption(
+            "Two steps: look up a student's real risk data first, then run the Sprint 5 LangGraph "
+            "agent and see exactly why it routed the way it did — the confidence it routed on, the "
+            "factors behind the drafted message, and which resources were an exact match vs. a "
+            "re-ranked similarity guess."
+        )
+        _provider_status_caption()
+        _storage_backend_caption()
+
+        dataset = st.selectbox("Dataset", ["uci", "oulad"], key="ia_dataset")
+        id_mode = st.radio(
+            "Look up by", ["Row-index", "Real Student ID"], horizontal=True, key="ia_id_mode",
+            help="Row-index: the position shown on the Risk Dashboard page (1, 2, 3...). "
+                 "Real Student ID: the actual ID from your roster "
+                 f"({'a number like 628653' if dataset == 'oulad' else 'e.g. UCI-0091'}).",
+        )
+        id_placeholder = "628653" if (dataset == "oulad" and id_mode == "Real Student ID") else \
+                          "UCI-0091" if id_mode == "Real Student ID" else "0"
+        raw_id = st.text_input(f"Student ID ({id_mode})", value="" if id_mode == "Real Student ID" else "0",
+                                placeholder=id_placeholder, key="ia_student_id_raw")
+
+        st.subheader("1. Look up student")
+        if st.button("Look Up Student"):
+            try:
+                student_id = _resolve_student_lookup(dataset, id_mode, raw_id)
+                st.session_state["ia_risk_explanation"] = ai_tools.get_risk_explanation(dataset, student_id)
+                st.session_state["ia_lookup_key"] = f"{dataset}:{student_id}"
+                st.session_state["ia_resolved_student_id"] = student_id
+            except (StudentNotFoundError, DataNotFoundError) as e:
+                st.session_state.pop("ia_risk_explanation", None)
+                st.error(str(e))
+
+        risk_explanation = st.session_state.get("ia_risk_explanation")
+        student_id = st.session_state.get("ia_resolved_student_id")
+        lookup_key = f"{dataset}:{student_id}" if student_id else None
+        if risk_explanation and st.session_state.get("ia_lookup_key") == lookup_key:
+            threshold = (risk_queries.RISK_THRESHOLD_UCI if dataset == "uci" else risk_queries.RISK_THRESHOLD_OULAD)
+            if risk_explanation.get("display_student_id"):
+                st.caption(f"✅ Confirmed: **{risk_explanation['display_student_id']}** — the same real-world-checkable ID the AI Assistant chat uses.")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Risk score", f"{risk_explanation['risk_score']:.3f}", delta=f"{risk_explanation['risk_score'] - threshold:+.3f} vs. threshold")
+            m2.metric("Risk level", risk_explanation["risk_level"])
+            m3.metric("Persona", risk_explanation.get("persona_name", "—"))
+            student_label = risk_explanation.get("display_student_id") or risk_explanation.get("student_id", student_id)
+            factors_fig = intervention_charts.plot_student_factors(risk_explanation)
+            _show_and_cache_chart(f"SHAP factors — student {student_label}", factors_fig)
+
+            st.subheader("2. Run Intervention Agent")
+            check_disagreement = False
+            oulad_id_student = None
+            if dataset == "oulad":
+                # For OULAD, display_student_id IS the real id_student
+                # (see _display_student_id() in ai_assistant/tools.py --
+                # it reads the row's own id_student column directly), so
+                # the disagreement check can just reuse it instead of
+                # asking the teacher to re-type it into a second field.
+                # Previously this defaulted to a hardcoded placeholder
+                # (480959) with NO relationship to whatever student was
+                # actually just looked up -- silently running the
+                # disagreement check against an unrelated student unless
+                # the teacher noticed and overwrote it by hand.
+                resolved_real_id = risk_explanation.get("display_student_id")
+                same_student = st.checkbox(
+                    f"Also run the GRU/XGBoost disagreement check for this same student"
+                    f"{f' ({resolved_real_id})' if resolved_real_id else ''}",
+                    value=bool(resolved_real_id), disabled=not resolved_real_id,
+                )
+                check_different = st.checkbox("...or check a different OULAD id_student instead")
+                if same_student and not check_different and resolved_real_id:
+                    check_disagreement = True
+                    oulad_id_student = int(resolved_real_id)
+                elif check_different:
+                    check_disagreement = True
+                    oulad_id_student = st.number_input("Real OULAD id_student to check", min_value=1, step=1)
+
+            if st.button("Run Intervention Agent", type="primary"):
+                models_agree = None
+                if check_disagreement and oulad_id_student:
+                    try:
+                        gru_context, _, _ = ai_tools.get_gru_timeseries_context(int(oulad_id_student))
+                        models_agree = gru_context["models_agree"]
+                        if not models_agree:
+                            st.warning(
+                                f"GRU ({gru_context['gru_risk_level']}) and XGBoost "
+                                f"({gru_context['xgboost_risk_level']}) disagree on this student."
+                            )
+                    except StudentNotFoundError as e:
+                        st.warning(f"Disagreement check skipped: {e}")
+
+                decision = intervention_graph.run_intervention(
+                    dataset, student_id, risk_explanation,
+                    oulad_id_student=int(oulad_id_student) if (check_disagreement and oulad_id_student) else None,
+                    models_agree=models_agree,
+                )
+                logged = intervention_audit.log_decision(decision, run_id=f"single:{dataset}:{student_id}")
+                st.divider()
+                _render_decision(decision)
+                st.caption(f"Logged to {logged['storage_backend']}.")
+        else:
+            st.info("Look up a student above to see their real risk data before running the agent.")
+
+
+def page_intervention_agent_cohort(conn):
+    with _render_chat_toggle_and_columns():
+        st.header("Intervention Agent — Cohort Batch Run")
+        st.caption(
+            "Runs the Intervention Agent across a whole cohort slice at once (e.g. every High-risk "
+            "OULAD student) and logs one audit entry per student — the coverage/consistency record "
+            "the Sprint 5 plan calls out as currently missing."
+        )
+        _provider_status_caption()
+        _storage_backend_caption()
+
+        dataset = st.selectbox("Dataset", ["uci", "oulad"], key="ia_cohort_dataset")
+        risk_level = st.selectbox("Risk level filter", ["High", "Medium", "Low", "(all)"], key="ia_cohort_risk_level")
+        batch_size = st.slider("Number of students", min_value=1, max_value=25, value=5, key="ia_cohort_limit")
+
+        page_signature = f"{dataset}:{risk_level}:{batch_size}"
+        if st.session_state.get("ia_cohort_page_sig") != page_signature:
+            st.session_state["ia_cohort_page_sig"] = page_signature
+            st.session_state["ia_cohort_page"] = 0
+        page = st.session_state["ia_cohort_page"]
+
+        # Cheap call just to learn how many students exist in this
+        # filtered slice -- get_cohort_summary's risk_level_counts /
+        # total_students describe the WHOLE filtered population
+        # regardless of `limit`, so limit=1 is enough to size the pool
+        # without fetching a full page of IDs we don't need yet.
+        pool_probe = ai_tools.get_cohort_summary(dataset, risk_level=None if risk_level == "(all)" else risk_level, limit=1)
+        pool_size = (pool_probe["risk_level_counts"].get(risk_level, 0) if risk_level != "(all)"
+                     else pool_probe["total_students"])
+        next_disabled = (page + 1) * batch_size >= pool_size
+
+        run_clicked = st.button("Run batch", type="primary")
+
+        nav_prev, nav_label, nav_next = st.columns([1, 2, 1])
+        with nav_prev:
+            prev_clicked = st.button("◀ Previous 5", disabled=(page == 0))
+        with nav_label:
+            shown_to = min((page + 1) * batch_size, pool_size)
+            st.caption(f"Page {page + 1} · students {page * batch_size + 1}–{shown_to} of {pool_size}")
+        with nav_next:
+            next_clicked = st.button("Next 5 ▶", disabled=next_disabled)
+
+        if prev_clicked:
+            st.session_state["ia_cohort_page"] = max(0, page - 1)
+            st.rerun()
+        if next_clicked:
+            st.session_state["ia_cohort_page"] += 1
+            st.rerun()
+        page = st.session_state["ia_cohort_page"]
+
+        if run_clicked or "ia_cohort_rows" in st.session_state:
+            fetch_limit = (page + 1) * batch_size
+            cohort = ai_tools.get_cohort_summary(
+                dataset, risk_level=None if risk_level == "(all)" else risk_level, limit=fetch_limit
+            )
+            page_student_ids = cohort["top_student_ids"][page * batch_size: fetch_limit]
+
+            if run_clicked:
+                if not page_student_ids:
+                    st.info("No students matched this filter.")
+                    return
+
+                rows, decisions_by_student = [], {}
+                progress = st.progress(0.0)
+                for i, sid in enumerate(page_student_ids):
+                    try:
+                        risk_explanation = ai_tools.get_risk_explanation(dataset, sid)
+                        decision = intervention_graph.run_intervention(dataset, sid, risk_explanation)
+                        intervention_audit.log_decision(decision, run_id=f"cohort:{dataset}:{risk_level}:page{page}")
+                        decisions_by_student[sid] = decision
+                        rows.append({
+                            "student_id": sid,
+                            "risk_score": risk_explanation["risk_score"],
+                            "risk_level": risk_explanation["risk_level"],
+                            "decision": decision["decision"],
+                            "router_confidence": round(decision["router_confidence"], 3),
+                            "source": decision["source"],
+                        })
+                    except (StudentNotFoundError, DataNotFoundError) as e:
+                        rows.append({"student_id": sid, "risk_score": None, "risk_level": None,
+                                      "decision": "error", "router_confidence": None, "source": str(e)})
+                    progress.progress((i + 1) / len(page_student_ids))
+
+                st.session_state["ia_cohort_rows"] = rows
+                st.session_state["ia_cohort_decisions"] = decisions_by_student
+                st.session_state["ia_cohort_run_id"] = f"cohort:{dataset}:{risk_level}:page{page}"
+
+        if "ia_cohort_rows" in st.session_state:
+            df = pd.DataFrame(st.session_state["ia_cohort_rows"])
+            st.dataframe(df, use_container_width=True)
+            st.caption(f"{len(df)} decisions logged (run_id={st.session_state['ia_cohort_run_id']}) — see the Teacher Dashboard page.")
+            counts = df["decision"].value_counts()
+            st.bar_chart(counts)
+
+            st.subheader("Per-student detail")
+            decisions_by_student = st.session_state["ia_cohort_decisions"]
+            for sid, decision in decisions_by_student.items():
+                label = decision.get("display_student_id") or f"Student {sid}"
+                with st.expander(f"{label} — {_decision_badge(decision['decision'])}"):
+                    _render_decision(decision)
+
+
+def page_teacher_dashboard(conn):
+    with _render_chat_toggle_and_columns():
+        st.header("Teacher Dashboard — Intervention Agent")
+        st.caption(
+            "A read-only view of everything the Intervention Agent has done, across every run mode "
+            "(single-student, cohort batch, and the FastAPI /agent endpoints) — for a teacher or "
+            "admin to see coverage and consistency at a glance, not just the outcome of the one "
+            "student they last looked up."
+        )
+        _storage_backend_caption()
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            dataset_filter = st.selectbox("Dataset", ["(all)", "uci", "oulad"], key="dash_dataset")
+        with col2:
+            decision_filter = st.selectbox("Decision", ["(all)", "nudge", "resource", "escalate"], key="dash_decision")
+        with col3:
+            max_entries = st.slider("Max raw entries to load (before dedup)", 10, 1000, 200, key="dash_max")
+
+        dedup = st.checkbox(
+            "Show one row per student (most recent decision only)", value=True, key="dash_dedup",
+            help="Off shows every logged run, including repeats from re-running the same student or "
+                 "cohort batch multiple times. On (default) keeps only each student's latest decision, "
+                 "per dataset, so totals and charts reflect current status rather than run history.",
+        )
+
+        entries = intervention_audit.read_audit_log(limit=max_entries)
+        if not entries:
+            st.info(
+                "No decisions logged yet. Run the agent from the Single Student or Cohort Batch Run "
+                "pages (or POST to the FastAPI /agent/run endpoint) to populate this dashboard."
+            )
+            return
+
+        df = pd.DataFrame(entries)  # already most-recent-first from read_audit_log()
+        if dataset_filter != "(all)":
+            df = df[df["dataset"] == dataset_filter]
+        if decision_filter != "(all)":
+            df = df[df["decision"] == decision_filter]
+
+        if df.empty:
+            st.info("No decisions match the current filters.")
+            return
+
+        raw_count = len(df)
+        if dedup:
+            df = df.drop_duplicates(subset=["dataset", "student_id"], keep="first")  # keep=first == most recent, since df is already ordered that way
+            if raw_count > len(df):
+                st.caption(f"Deduplicated {raw_count} logged runs down to {len(df)} unique students (most recent decision kept for each).")
+
+        total = len(df)
+        escalated = int((df["decision"] == "escalate").sum())
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        metric_col1.metric("Unique students" if dedup else "Total decisions", total)
+        metric_col2.metric("Nudges", int((df["decision"] == "nudge").sum()))
+        metric_col3.metric("Resources sent", int((df["decision"] == "resource").sum()))
+        metric_col4.metric("Escalated to human", escalated, delta=f"{escalated / total * 100:.0f}% of total" if total else None)
+
+        st.subheader("Diagrams")
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            _show_and_cache_chart("Teacher Dashboard — Decisions by Branch", intervention_charts.plot_decision_distribution(df))
+        with chart_col2:
+            _show_and_cache_chart("Teacher Dashboard — Decisions by Risk Level", intervention_charts.plot_risk_level_breakdown(df))
+
+        _show_and_cache_chart("Teacher Dashboard — Decisions Over Time", intervention_charts.plot_decisions_over_time(df))
+
+        if df["dataset"].nunique() > 1:
+            _show_and_cache_chart("Teacher Dashboard — Escalation Rate by Dataset", intervention_charts.plot_escalation_rate_by_dataset(df))
+
+        st.subheader("Recent decisions")
+        display_cols = [c for c in ["logged_at", "run_id", "dataset", "student_id", "display_student_id", "risk_level",
+                                     "decision", "router_confidence", "source", "escalation_reason"] if c in df.columns]
+        st.dataframe(df[display_cols], use_container_width=True)
+
+        # CSV export -- "shown" = exactly the table above; "full" = every
+        # column (rationale, drafted_message, resources, trace...) for the
+        # same filtered rows. utf-8-sig so Excel opens it cleanly.
+        def _csv_bytes(frame: pd.DataFrame) -> bytes:
+            out = frame.copy()
+            for c in out.columns:  # lists (resources_used, agent_trace) -> JSON text
+                if out[c].map(lambda v: isinstance(v, (list, dict))).any():
+                    out[c] = out[c].map(lambda v: json.dumps(v, ensure_ascii=False) if isinstance(v, (list, dict)) else v)
+            return out.to_csv(index=False).encode("utf-8-sig")
+
+        dl_col1, dl_col2 = st.columns(2)
+        dl_col1.download_button(
+            "⬇️ Download table as CSV", data=_csv_bytes(df[display_cols]),
+            file_name="intervention_decisions.csv", mime="text/csv", key="dash_dl_shown",
+        )
+        dl_col2.download_button(
+            "⬇️ Download full detail as CSV", data=_csv_bytes(df),
+            file_name="intervention_decisions_full.csv", mime="text/csv", key="dash_dl_full",
+        )
+
+        with st.expander("Full decision detail"):
+            entries_filtered = df.to_dict("records")
+            selected = st.selectbox(
+                "Pick an entry", options=range(len(entries_filtered)),
+                format_func=lambda i: f"{entries_filtered[i].get('logged_at', '?')} — student "
+                                       f"{entries_filtered[i].get('student_id', '?')} — {entries_filtered[i].get('decision', '?')}",
+            )
+            _render_decision(entries_filtered[selected])
+
+
+def _current_page_student_context() -> str | None:
+    """One-line description of whatever student is currently loaded on
+    screen -- Single Student's last lookup, or if that's empty, the last
+    cohort batch run's headline. Passed as page_context to the agent
+    (ai_assistant/agent.py) so "why is this student at risk" resolves
+    without the agent asking which student you mean, the same way
+    ia_chart_gallery already lets "explain this graph" resolve to
+    whatever chart is on screen. Returns None when nothing's loaded yet
+    -- the agent then behaves exactly as it did before this existed."""
+    r = st.session_state.get("ia_risk_explanation")
+    sid = st.session_state.get("ia_resolved_student_id")
+    if r and sid:
+        label = r.get("display_student_id") or sid
+        return (f"Currently displayed on this page: {st.session_state.get('ia_dataset', '?')} student "
+                f"{label} (row-index {sid}), risk_score={r.get('risk_score')}, "
+                f"risk_level={r.get('risk_level')}, persona={r.get('persona_name', '—')}.")
+
+    rows = st.session_state.get("ia_cohort_rows")
+    run_id = st.session_state.get("ia_cohort_run_id")
+    if rows:
+        return (f"Currently displayed on this page: a cohort batch run ({run_id}) covering "
+                f"{len(rows)} students -- student_ids {[r.get('student_id') for r in rows]}.")
+
+    return None
+
+
+def _render_intervention_chat_panel(show_examples: bool = True):
+    """The actual chat UI -- message history + input + response rendering.
+    Factored out of page_intervention_agent_chat() so the SAME chat, same
+    session (session_key="ia_chat"), same chart gallery, can run either as
+    its own full page OR embedded in an expander at the bottom of the
+    Single Student / Cohort Batch Run / Teacher Dashboard pages -- so a
+    teacher can ask about what they're looking at without leaving the
+    page (Sprint 5's "chat in parallel with the rest of the UI" mode,
+    not only its own separate destination)."""
+    session_key = "ia_chat"
+    teacher_id = st.session_state.get("teacher_id", "").strip()
+    if teacher_id:
+        genai_memory.load_history_into_session(st.session_state, teacher_id, session_key)
+
+    if show_examples:
+        with st.expander("Example messages"):
+            st.markdown(
+                "- \"Run an intervention for student 12\" *(uci/oulad row-index)*\n"
+                "- \"Why is student 5 at risk?\"\n"
+                "- \"What should I do for student 8?\"\n"
+                "- \"Explain this graph\" / \"What does the escalation rate chart mean?\" "
+                "*(after viewing a chart on Single Student, Cohort Batch Run, or Teacher Dashboard)*\n"
+                "- \"Escalate student 20 to a mentor\"\n"
+            )
+
+    gallery = st.session_state.get("ia_chart_gallery", {})
+    page_context = _current_page_student_context()
+    if page_context:
+        st.caption(f"🧑‍🎓 {page_context}")
+    if gallery:
+        st.caption(f"📊 Charts available to reference: {', '.join(gallery.keys())}")
+    else:
+        st.caption("📊 No charts viewed yet this session — visit another Sprint 5 page first if you want to ask about one.")
+
+    for msg in genai_memory.get_session_history(st.session_state, session_key).messages:
+        with st.chat_message("user" if msg.type == "human" else "assistant"):
+            st.markdown(msg.content)
+
+    question = st.chat_input("Ask about a student, a chart, or tell it to run an intervention…", key=f"ia_chat_input_{session_key}")
+    if question:
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        with st.chat_message("assistant"):
+            result_holder = agent._StreamResult()
+            current_gallery = st.session_state.get("ia_chart_gallery")
+            current_page_context = _current_page_student_context()
+            try:
+                answer = st.write_stream(
+                    agent.run_agent_stream_with_artifacts(
+                        question, st.session_state, result_holder, session_key,
+                        chart_gallery=current_gallery, page_context=current_page_context,
+                    )
+                )
+            except Exception:
+                # Same defense-in-depth fallback as page_ai_assistant.
+                full = agent.run_agent(question, st.session_state, session_key,
+                                        chart_gallery=current_gallery, page_context=current_page_context)
+                answer = full["answer"]
+                result_holder.source = full["source"]
+                result_holder.tool_calls_made = full["tool_calls_made"]
+                result_holder.chart_image_attached = full["chart_image_attached"]
+                st.markdown(answer)
+
+            if teacher_id:
+                genai_memory.save_turn_to_db(teacher_id, session_key, question, answer)
+
+            if result_holder.source == "unconfigured":
+                st.caption("⚠️ No LLM configured")
+            elif result_holder.chart_image_attached:
+                st.caption(
+                    f"🤖 LLM (streamed) · 📷 analyzed the visible chart(s) · "
+                    f"tools used: {', '.join(result_holder.tool_calls_made) or 'none'}"
+                )
+            elif result_holder.tool_calls_made:
+                st.caption(f"🤖 LLM (streamed) · tools used: {', '.join(result_holder.tool_calls_made)}")
+            else:
+                st.caption("🤖 LLM (streamed) · general question, no lookup needed")
+
+
+def _render_side_chat_panel():
+    """Chat panel content for the right-hand column when open -- see
+    _render_chat_toggle_and_columns() below, which decides whether it's
+    shown at all and owns the 1/3-width column it renders into."""
+    st.markdown("#### 💬 Ask the Intervention Agent")
+    st.caption("About this page, a chart you've viewed, or tell it to run an intervention.")
+    _render_intervention_chat_panel(show_examples=False)
+
+
+def _render_chat_toggle_and_columns():
+    """Shared layout for all three Sprint 5 pages (Single Student, Cohort
+    Batch Run, Teacher Dashboard) -- one robot-icon button that toggles
+    the chat panel on and off, and hands back a container to render the
+    page's own content into. Use as:
+
+        def page_x(conn):
+            with _render_chat_toggle_and_columns():
+                st.header(...)
+                ...rest of the page, unchanged...
+
+    Closed by default: the page gets the FULL width, not 1/3 given away
+    to an empty panel. Clicking 🤖 allocates the right 1/3 of the screen
+    to "Ask the Intervention Agent" (st.columns([2, 1])) and swaps the
+    icon to ✕ to close it again -- same toggle, same button, same spot,
+    on all three pages.
+
+    Both branches return a container keyed "ia_main_col", so the
+    scrollable-column CSS below applies identically whether chat is open
+    or closed -- the main content always gets its own independent
+    scrollbar, separate from the full browser-page scrollbar and (when
+    open) separate from the chat panel's own scrollbar. Three distinct
+    scroll regions, as asked for.
+    """
+    st.session_state.setdefault("ia_chat_open", False)
+
+    header_col, toggle_col = st.columns([5, 1])  # header_col intentionally empty -- the page's own
+    # st.header() below renders full-width beneath this row regardless; this row exists only to
+    # place the toggle button top-right, matching where the panel itself opens.
+    with toggle_col:
+        if st.session_state["ia_chat_open"]:
+            clicked = st.button("✕ Close chat", key="ia_chat_toggle", use_container_width=True)
+        else:
+            clicked = st.button("🤖 Ask Agent", key="ia_chat_toggle", use_container_width=True, type="primary")
+        if clicked:
+            st.session_state["ia_chat_open"] = not st.session_state["ia_chat_open"]
+            st.rerun()
+
+    if st.session_state["ia_chat_open"]:
+        main_col, chat_col = st.columns([2, 1])
+        with chat_col.container(key="ia_chat_col"):
+            _render_side_chat_panel()
+    else:
+        main_col = st.container()
+
+    return main_col.container(key="ia_main_col")
+
+
+def page_intervention_agent_chat(conn):
+    st.header("Intervention Agent — Chat")
+    st.caption(
+        "Type what you want in plain language — the assistant decides which tool to call, "
+        "including actually running and logging a real intervention when you explicitly ask "
+        "for one. It can also explain any chart you've viewed on the other Sprint 5 pages in "
+        "this session, in plain language — just ask about \"the graph\" or \"this chart\". This "
+        "same chat is also available at the bottom of the Single Student, Cohort Batch Run, and "
+        "Teacher Dashboard pages, so you don't have to come here to use it."
+    )
+    _provider_status_caption()
+    _storage_backend_caption()
+    _render_intervention_chat_panel(show_examples=True)
+
+
+SPRINT5_PAGES = {
+    "Intervention Agent — Chat": page_intervention_agent_chat,
+    "Intervention Agent — Single Student": page_intervention_agent_student,
+    "Intervention Agent — Cohort Batch Run": page_intervention_agent_cohort,
+    "Teacher Dashboard": page_teacher_dashboard,
+}
+
+
 def main():
-    st.sidebar.title("Student Performance Analytics")
+    _inject_custom_css()
+
+    # Same one-time setup page_ai_assistant() (Sprint 4) already pays for
+    # itself -- moved here so it runs at the app's actual initial load,
+    # regardless of which module a teacher opens first. Previously this
+    # was only ever called from page_ai_assistant(), so a teacher going
+    # straight to any Sprint 5 page skipped it entirely: the sentence-
+    # transformer model load + Chroma collection build then happened for
+    # the first time deep inside resource_node's first real call, with
+    # no spinner and no visible cause for the delay. @st.cache_resource
+    # means this still only actually runs once per app process no matter
+    # how many pages call it -- calling it here doesn't duplicate work
+    # for page_ai_assistant, it just guarantees it always happens early.
+    rag_backend = _warm_up_rag()
+    if "hash-fallback" in rag_backend:
+        st.sidebar.caption(
+            f"⚠ Running on the offline hash-fallback embedding, not real semantic search "
+            f"— sentence-transformers likely couldn't be downloaded."
+        )
+
+    st.sidebar.markdown("### 📊 Student Performance Analytics")
+    st.sidebar.caption("Sprint 2 → 5 · analytics, risk, explanation, intervention")
+    st.session_state["teacher_id"] = st.sidebar.text_input(
+        "Teacher ID", value=st.session_state.get("teacher_id", ""),
+        placeholder="e.g. your name or staff ID",
+        help="Not a login -- no password. Typing the same ID again on a later visit "
+             "reloads that name's previous Sprint 5 chat history from the database. "
+             "Leave blank and chat still works, it just won't be remembered next time.",
+    )
+    st.sidebar.divider()
     module = st.sidebar.selectbox(
         "Module",
         [
             "Sprint 2 — Student Performance Analytics",
             "Sprint 3 — Risk Prediction",
             "Sprint 4 — Risk Explanation (AI Assistant)",
+            "Sprint 5 — Intervention Agent",
         ],
     )
     if module.startswith("Sprint 2"):
         pages = SPRINT2_PAGES
     elif module.startswith("Sprint 3"):
         pages = SPRINT3_PAGES
-    else:
+    elif module.startswith("Sprint 4"):
         pages = SPRINT4_PAGES
+    else:
+        pages = SPRINT5_PAGES
     choice = st.sidebar.radio("Report", list(pages.keys()))
 
     try:
