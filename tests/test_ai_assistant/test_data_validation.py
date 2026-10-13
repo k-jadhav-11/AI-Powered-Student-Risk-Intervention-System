@@ -31,7 +31,7 @@ def test_returned_student_id_exists_in_source_data():
 @pytest.mark.parametrize("dataset", ["uci", "oulad"])
 def test_returned_shap_features_exist_in_feature_matrix(dataset):
     real_columns = set(pd.read_csv(f"data/processed/{dataset}_feature_matrix.csv").columns) - {"at_risk"}
-    result = tools.get_student_shap(dataset, "0")
+    result = tools.get_student_shap(dataset, "1")
     all_factors = result["academic_factors"] + result["engagement_factors"] + result["contextual_factors"]
     for f in all_factors:
         assert f["feature"] in real_columns
@@ -41,7 +41,7 @@ def test_returned_shap_features_exist_in_feature_matrix(dataset):
 @pytest.mark.parametrize("dataset", ["uci", "oulad"])
 def test_shap_features_are_actual_model_inputs(dataset):
     model_input_cols = set(risk_queries.UCI_FEATURE_COLUMNS if dataset == "uci" else risk_queries.OULAD_FEATURE_COLUMNS)
-    result = tools.get_student_shap(dataset, "0")
+    result = tools.get_student_shap(dataset, "1")
     all_factors = result["academic_factors"] + result["engagement_factors"] + result["contextual_factors"]
     for f in all_factors:
         assert f["feature"] in model_input_cols
@@ -51,7 +51,7 @@ def test_shap_features_are_actual_model_inputs(dataset):
 def test_risk_score_exactly_matches_source_csv():
     raw = pd.read_csv("data/processed/oulad_risk_scores.csv")
     for idx in [0, 50, 500]:
-        result = tools.get_student_risk("oulad", str(idx))
+        result = tools.get_student_risk("oulad", str(idx + 1))
         assert result["risk_score"] == pytest.approx(float(raw.loc[idx, "risk_score"]))
 
 
@@ -100,16 +100,16 @@ def test_model_name_matches_loaded_model_class(dataset):
     assert result["model_name"] == type(model).__name__ or result["model_name"] == risk_queries.get_model_class_name(dataset)
 
 
-# "Model metrics come from the existing summary JSON."
+# "Model metrics use the same configured threshold as the performance endpoint."
 @pytest.mark.parametrize("dataset", ["uci", "oulad"])
-def test_model_metrics_come_from_real_summary_json(dataset):
-    import json
-    with open(f"models/risk_model_{dataset}_v1_summary.json") as f:
-        summary = json.load(f)
+def test_model_metrics_match_performance_endpoint(dataset):
+    performance = risk_queries.get_model_performance(dataset)
     result = tools.get_model_information(dataset)
-    assert result["model_metrics"]["precision"] == summary["test_precision_at_risk"]
-    assert result["model_metrics"]["recall"] == summary["test_recall_at_risk"]
-    assert result["model_metrics"]["f1"] == summary["test_f1_at_risk"]
+    assert result["threshold_used"] == performance["threshold_used"]
+    assert result["model_metrics"]["precision"] == performance["precision"]
+    assert result["model_metrics"]["recall"] == performance["recall"]
+    assert result["model_metrics"]["f1"] == performance["f1"]
+    assert result["model_metrics"]["roc_auc"] == performance["roc_auc"]
 
 
 # "GRU attribution dimensions match the sequence dimensions."

@@ -115,7 +115,7 @@ def get_subject_failure_rates(conn, pass_mark: float = 35, class_name: str = Non
 def get_all_scores(conn, subject: str = None, class_name: str = None) -> pd.DataFrame:
     """Every individual score record, optionally filtered by subject and/or a single grade."""
     query = """
-        SELECT st.name AS student_name, st.roll_number, st.class_name,
+        SELECT st.student_id, st.name AS student_name, st.roll_number, st.class_name,
                sub.subject_name AS subject, m.test_name, m.score, m.max_score, m.test_date
         FROM marks m
         JOIN students st ON m.student_id = st.student_id
@@ -153,7 +153,8 @@ def find_student(conn, search_term: str, class_name: str = None) -> pd.DataFrame
 def get_student_scores_over_time(conn, student_id: int) -> pd.DataFrame:
     """All of one student's scores across tests/subjects, ordered by date."""
     query = """
-        SELECT sub.subject_name AS subject, m.test_name, m.score, m.max_score, m.test_date
+        SELECT m.student_id, sub.subject_name AS subject, m.test_name,
+               m.score, m.max_score, m.test_date
         FROM marks m
         JOIN subjects sub ON m.subject_id = sub.subject_id
         WHERE m.student_id = %s

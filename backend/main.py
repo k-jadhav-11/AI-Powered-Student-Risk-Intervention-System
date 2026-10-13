@@ -6,9 +6,11 @@ Expose health-check and API endpoints for local development.
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
 from .routers import agent as agent_router
+from .routers import sprint2_router, sprint3_router
 
 
 @asynccontextmanager
@@ -18,10 +20,17 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Student Analytics Platform -- Intervention Agent API",
-    description="Sprint 5's LangGraph Intervention Agent, wrapped behind REST.",
+    title="Student Analytics Platform API",
+    description="REST endpoints for student analytics, risk prediction, and interventions.",
     version="0.1.0",
     lifespan=_lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -39,3 +48,5 @@ def root_health():
 
 
 app.include_router(agent_router.router)
+app.include_router(sprint2_router.router)
+app.include_router(sprint3_router.router)

@@ -1,9 +1,18 @@
 # ai_assistant/agent.py
 
 import contextvars
+import base64
+from io import BytesIO
+import re
 from typing import Iterator
+import pandas as pd
+import matplotlib
 from langsmith import traceable, trace
+
+matplotlib.use("Agg")
+
 from src.analytics.exceptions import DataNotFoundError, StudentNotFoundError
+from src.risk import model_gru, risk_charts, risk_queries
 from . import llm_client, memory
 from . import tools as ai_tools
 from .prompts import AGENT_SYSTEM_PROMPT, CHART_IMAGE_ANALYSIS_ADDENDUM
@@ -23,6 +32,59 @@ class AgentArtifacts:
         self.gru_student_id: str | None = None
         self.gru_first_high_risk_week: int | None = None
         self.gru_actual_final_result: str | None = None
+        self.gru_event_week: int | None = None
+
+    def chart_payload(self) -> dict:
+        if self.gru_weekly_df is None or self.gru_trajectory_df is None:
+            return {}
+
+        weekly = self.gru_weekly_df[
+            ["week_number", "total_clicks", "days_active"]
+        ]
+        trajectory = self.gru_trajectory_df[
+            ["week_number", "risk_score"]
+        ]
+        figure = risk_charts.plot_student_engagement_and_risk(
+            self.gru_weekly_df,
+            self.gru_trajectory_df,
+            risk_queries.RISK_THRESHOLD_OULAD_GRU,
+            self.gru_first_high_risk_week,
+            self.gru_event_week,
+            title=f"Student {self.gru_student_id}"
+            + (
+                f" (actual: {self.gru_actual_final_result})"
+                if self.gru_actual_final_result
+                else ""
+            ),
+        )
+        image = BytesIO()
+        try:
+            figure.savefig(image, format="png", dpi=144, bbox_inches="tight")
+        finally:
+            risk_charts.plt.close(figure)
+
+        return {
+            "gru_timeseries": {
+                "student_id": self.gru_student_id,
+                "image_png_base64": base64.b64encode(image.getvalue()).decode("ascii"),
+                "weekly_engagement": [
+                    {
+                        "week_number": int(row.week_number),
+                        "total_clicks": int(row.total_clicks),
+                        "days_active": int(row.days_active),
+                    }
+                    for row in weekly.itertuples(index=False)
+                ],
+                "risk_trajectory": [
+                    {
+                        "week_number": int(row.week_number),
+                        "risk_score": float(row.risk_score),
+                    }
+                    for row in trajectory.itertuples(index=False)
+                ],
+                "first_high_risk_week": self.gru_first_high_risk_week,
+            }
+        }
 
 
 _current_artifacts: contextvars.ContextVar[AgentArtifacts] = contextvars.ContextVar("current_artifacts")
@@ -94,7 +156,20 @@ def build_tools() -> list:
         Shows clicks, active weeks, trends, and engagement decline.
         """
         try:
-            return ai_tools.get_student_engagement(id_student)
+            result = ai_tools.get_student_engagement(id_student)
+            chart_rows = result.pop("_weekly_chart_data")
+            weekly = pd.DataFrame(chart_rows)
+            gru_model_obj, gru_cfg = model_gru.load_gru_model("oulad")
+            trajectory, first_high_risk_week = model_gru.compute_gru_risk_trajectory(
+                gru_model_obj, gru_cfg, weekly
+            )
+            artifacts = _current_artifacts.get()
+            artifacts.gru_weekly_df = weekly
+            artifacts.gru_trajectory_df = trajectory
+            artifacts.gru_student_id = str(id_student)
+            artifacts.gru_first_high_risk_week = first_high_risk_week
+            artifacts.gru_event_week = model_gru.get_actual_event_week(id_student)
+            return result
         except StudentNotFoundError as e:
             return {"error": str(e)}
 
@@ -123,6 +198,7 @@ def build_tools() -> list:
             artifacts.gru_student_id = str(id_student)
             artifacts.gru_first_high_risk_week = context["first_high_risk_week"]
             artifacts.gru_actual_final_result = context["actual_final_result"]
+            artifacts.gru_event_week = model_gru.get_actual_event_week(id_student)
             return context
         except StudentNotFoundError as e:
             return {"error": str(e)}
@@ -194,13 +270,22 @@ def _get_cached_model_and_tools(provider: str | None):
     return model, model_with_tools, _TOOLS_CACHE
 
 
-_CHART_REFERENCE_WORDS = ("graph", "chart", "diagram", "plot", "image", "picture", "trajectory")
+_CHART_REFERENCE_WORDS = (
+    "graph", "chart", "diagram", "plot", "image", "picture", "trajectory",
+    "statistic", "number", "numbers", "value", "count", "percentage", "percent", "rate",
+    "average", "metric", "bar", "trend", "this", "that", "these", "those",
+    "shown", "above", "how many", "total", "unique", "risk level", "risk-level",
+    "escalation", "students",
+)
 
 
 def _looks_like_chart_question(question: str) -> bool:
     """Check whether the question explicitly refers to a chart or visual."""
     q = question.lower()
-    return any(word in q for word in _CHART_REFERENCE_WORDS)
+    return (
+        any(re.search(rf"\b{re.escape(word)}\b", q) for word in _CHART_REFERENCE_WORDS)
+        or re.search(r"\b\d+(?:\.\d+)?\s*(?:%|percent)?\b", q) is not None
+    )
 
 
 def _build_message_history(session_state: dict, session_key: str, question: str, system_prompt: str,
@@ -228,7 +313,11 @@ def _build_message_history(session_state: dict, session_key: str, question: str,
         labels = ", ".join(images.keys())
         content = [{"type": "text", "text": f"{question_text}\n\n(Charts currently visible: {labels}.)"}]
         for b64 in images.values():
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+            if b64.startswith("data:image/"):
+                image_url = b64
+            else:
+                image_url = f"data:image/png;base64,{b64}"
+            content.append({"type": "image_url", "image_url": {"url": image_url}})
         messages.append(HumanMessage(content=content))
     else:
         messages.append(HumanMessage(content=question_text))

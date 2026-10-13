@@ -13,11 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from ai_assistant import tools
 from src.analytics.exceptions import StudentNotFoundError
-from src.risk import model_gru
+from src.risk import model_gru, risk_queries
 
 
 def test_get_student_risk_matches_real_csv():
-    result = tools.get_student_risk("uci", "0")
+    result = tools.get_student_risk("uci", "1")
     raw = pd.read_csv("data/processed/uci_risk_scores.csv")
     assert result["risk_score"] == pytest.approx(float(raw.loc[0, "risk_score"]))
     assert result["risk_level"] == raw.loc[0, "risk_level"]
@@ -41,18 +41,16 @@ def test_get_student_shap_returns_only_real_columns():
 def test_get_student_shap_no_risk_score_leaks_in():
     """get_student_shap is supposed to be surgical -- no risk_score/level
     field should appear in its output (that's get_student_risk's job)."""
-    result = tools.get_student_shap("uci", "0")
+    result = tools.get_student_shap("uci", "1")
     assert "risk_score" not in result
     assert "risk_level" not in result
 
 
-def test_get_model_information_matches_summary_json():
-    import json
-    with open("models/risk_model_uci_v1_summary.json") as f:
-        summary = json.load(f)
+def test_get_model_information_matches_configured_threshold_metrics():
+    performance = risk_queries.get_model_performance("uci")
     result = tools.get_model_information("uci")
-    assert result["model_metrics"]["precision"] == summary["test_precision_at_risk"]
-    assert result["model_metrics"]["recall"] == summary["test_recall_at_risk"]
+    assert result["model_metrics"]["precision"] == performance["precision"]
+    assert result["model_metrics"]["recall"] == performance["recall"]
 
 
 def test_get_model_information_bad_dataset_raises():

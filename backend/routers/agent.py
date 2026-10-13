@@ -7,10 +7,13 @@ Handles student ID resolution consistently across run, batch, and audit endpoint
 from __future__ import annotations
 
 import logging
+import json
+import contextvars
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from ai_assistant import agent as explain_agent
 from ai_assistant import llm_client
@@ -423,9 +426,10 @@ def run_batch(
     # 4. Limit cohort
     # ========================================================
 
-    cohort_df = cohort_df.head(
-        payload.limit
-    )
+    total_students = len(cohort_df)
+    cohort_df = cohort_df.iloc[
+        payload.offset:payload.offset + payload.limit
+    ]
 
     # ========================================================
     # 5. Process each student
@@ -592,6 +596,9 @@ def run_batch(
 
     return BatchInterventionResponse(
         run_id=run_id,
+        offset=payload.offset,
+        limit=payload.limit,
+        total_students=total_students,
         results=results,
         errors=errors,
     )
@@ -843,7 +850,7 @@ def chat(
 
     genai_memory.load_history_into_session(
         session_state,
-        session_id,
+        payload.teacher_id or session_id,
         session_key,
     )
 
@@ -856,6 +863,8 @@ def chat(
         session_state,
         session_key,
         provider=payload.provider,
+        page_context=payload.page_context,
+        chart_gallery=payload.chart_gallery,
     )
 
     # ========================================================
@@ -873,7 +882,7 @@ def chat(
     # ========================================================
 
     genai_memory.save_turn_to_db(
-        session_id,
+        payload.teacher_id or session_id,
         session_key,
         payload.question,
         answer,
@@ -923,6 +932,70 @@ def chat(
         ],
         session_id=session_id,
         history=full_history,
+        charts=result["artifacts"].chart_payload(),
+    )
+
+
+@router.post("/chat/stream")
+def chat_stream(payload: ChatRequest):
+    """Stream assistant tokens as server-sent events for browser chat clients."""
+    session_id = payload.session_id or f"chat-{uuid.uuid4().hex[:8]}"
+    session_key = "api_chat"
+
+    def event_stream():
+        session_state: dict = {}
+        history_owner = payload.teacher_id or session_id
+        genai_memory.load_history_into_session(session_state, history_owner, session_key)
+        yield f"event: start\ndata: {json.dumps({'session_id': session_id})}\n\n"
+
+        result = explain_agent._StreamResult()
+        answer_parts: list[str] = []
+        agent_context = contextvars.copy_context()
+        agent_chunks = iter(explain_agent.run_agent_stream_with_artifacts(
+            payload.question,
+            session_state,
+            result,
+            session_key=session_key,
+            provider=payload.provider,
+            page_context=payload.page_context,
+            chart_gallery=payload.chart_gallery,
+        ))
+        try:
+            while True:
+                try:
+                    chunk = agent_context.run(next, agent_chunks)
+                except StopIteration:
+                    break
+                answer_parts.append(chunk)
+                yield f"event: token\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+
+            answer = "".join(answer_parts)
+            genai_memory.save_turn_to_db(history_owner, session_key, payload.question, answer)
+            yield (
+                "event: complete\ndata: "
+                + json.dumps(
+                    {
+                        "session_id": session_id,
+                        "source": result.source,
+                        "tool_calls_made": result.tool_calls_made,
+                        "charts": result.artifacts.chart_payload(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+        except Exception as exc:
+            _terminal.exception("[/agent/chat/stream] Streaming response failed")
+            yield (
+                "event: error\ndata: "
+                + json.dumps({"message": str(exc)}, ensure_ascii=False)
+                + "\n\n"
+            )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

@@ -17,6 +17,7 @@ onto Sprint 3.
 """
 import os
 import json
+from functools import lru_cache
 
 import joblib
 import numpy as np
@@ -126,6 +127,85 @@ def load_feature_matrix(dataset: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+def load_persona_student_ids(dataset: str) -> pd.DataFrame:
+    """Return IDs aligned to persona rows, rejecting any unverifiable row mapping."""
+    if dataset not in ("uci", "oulad"):
+        raise ValueError(f"dataset must be 'uci' or 'oulad', got {dataset!r}")
+
+    personas = load_personas(dataset)
+    features = load_feature_matrix(dataset)
+    if "actual_at_risk" not in personas or "at_risk" not in features:
+        raise ValueError(
+            f"{dataset} persona and feature files must include their actual risk labels."
+        )
+    if len(personas) != len(features):
+        raise ValueError(
+            f"{dataset} persona and feature row counts differ "
+            f"({len(personas)} != {len(features)}); student IDs cannot be aligned."
+        )
+
+    if not np.array_equal(
+        personas["actual_at_risk"].to_numpy(),
+        features["at_risk"].to_numpy(),
+    ):
+        raise ValueError(
+            f"{dataset} persona and feature rows are not aligned; student IDs cannot be attached."
+        )
+
+    if dataset == "uci":
+        risk_scores = load_risk_scores(dataset)
+        if len(risk_scores) != len(personas):
+            raise ValueError(
+                f"UCI persona and risk-score row counts differ "
+                f"({len(personas)} != {len(risk_scores)}); student IDs cannot be aligned."
+            )
+        if not {"display_student_id", "risk_score", "actual_at_risk"}.issubset(
+            risk_scores.columns
+        ) or "risk_score" not in personas:
+            raise ValueError("UCI persona and risk-score files are missing ID alignment fields.")
+        for column in ("risk_score", "actual_at_risk"):
+            if not np.array_equal(
+                personas[column].to_numpy(),
+                risk_scores[column].to_numpy(),
+            ):
+                raise ValueError(
+                    f"UCI persona and risk-score {column} values differ; "
+                    "student IDs cannot be aligned."
+                )
+        identifiers = risk_scores[["display_student_id"]].copy()
+        if identifiers["display_student_id"].isna().any():
+            raise ValueError("UCI risk-score IDs contain missing values.")
+        identifiers["display_student_id"] = identifiers["display_student_id"].astype(str)
+    elif dataset == "oulad":
+        path = os.path.join(PROCESSED_DIR, "oulad_student_ids.csv")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "Missing data/processed/oulad_student_ids.csv; execute the id_lookup cell in "
+                "notebooks/oulad_notebooks/feature_engineering_oulad.ipynb "
+                "to generate the row-aligned OULAD student ID lookup."
+            )
+        identifiers = pd.read_csv(path)
+        if "id_student" not in identifiers.columns or len(identifiers) != len(personas):
+            raise ValueError(
+                "OULAD student ID lookup must contain one id_student for each persona row."
+            )
+        identifiers["id_student"] = pd.to_numeric(
+            identifiers["id_student"], errors="raise"
+        ).astype("int64")
+        if identifiers["id_student"].isna().any() or identifiers["id_student"].duplicated().any():
+            raise ValueError("OULAD student ID lookup contains missing or duplicate IDs.")
+        identifiers["display_student_id"] = identifiers["id_student"].astype(str)
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset!r}")
+
+    if identifiers["display_student_id"].isna().any():
+        raise ValueError(f"{dataset} student ID lookup contains missing display IDs.")
+    if identifiers["display_student_id"].duplicated().any():
+        raise ValueError(f"{dataset} student ID lookup contains duplicate display IDs.")
+    identifiers.insert(0, "row_index", np.arange(1, len(identifiers) + 1))
+    return identifiers.reset_index(drop=True)
+
+
 def get_test_split(dataset: str):
     """Reconstructs the exact held-out test split each training notebook
     used (same random_state/test_size/stratify) -- needed for the live
@@ -138,6 +218,48 @@ def get_test_split(dataset: str):
         X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
     )
     return X_train, X_test, y_train, y_test
+
+
+@lru_cache(maxsize=2)
+def get_model_performance(dataset: str) -> dict:
+    """Evaluate the loaded model on its held-out split at the configured risk threshold."""
+    if dataset not in ("uci", "oulad"):
+        raise ValueError(f"dataset must be 'uci' or 'oulad', got {dataset!r}")
+
+    from sklearn.metrics import (
+        accuracy_score,
+        confusion_matrix,
+        f1_score,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
+
+    _, X_test, _, y_test = get_test_split(dataset)
+    model = load_model(dataset)
+    threshold = RISK_THRESHOLD_UCI if dataset == "uci" else RISK_THRESHOLD_OULAD
+    y_true = y_test.astype(int)
+    probabilities = model.predict_proba(X_test)[:, 1]
+    predictions = (probabilities >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+
+    return {
+        "dataset": dataset,
+        "model_name": type(model).__name__,
+        "threshold_used": threshold,
+        "n_test": int(len(y_true)),
+        "accuracy": round(float(accuracy_score(y_true, predictions)), 4),
+        "precision": round(float(precision_score(y_true, predictions, zero_division=0)), 4),
+        "recall": round(float(recall_score(y_true, predictions, zero_division=0)), 4),
+        "f1": round(float(f1_score(y_true, predictions, zero_division=0)), 4),
+        "roc_auc": round(float(roc_auc_score(y_true, probabilities)), 4),
+        "confusion_matrix": {
+            "true_negative": int(tn),
+            "false_positive": int(fp),
+            "false_negative": int(fn),
+            "true_positive": int(tp),
+        },
+    }
 
 
 # --------------------------------------------------------------------------
@@ -173,4 +295,3 @@ def build_single_record(input_dict: dict, feature_columns: list) -> pd.DataFrame
     if missing:
         raise ValueError(f"Missing required fields: {sorted(missing)}")
     return pd.DataFrame([input_dict])[feature_columns]
-

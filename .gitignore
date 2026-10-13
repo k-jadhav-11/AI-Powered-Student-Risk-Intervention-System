@@ -12,7 +12,8 @@ env/
 
 # ---- Secrets ----
 .env
-.env.local
+.env.*
+!.env.example
 
 # ---- Jupyter ----
 .ipynb_checkpoints/
@@ -21,8 +22,14 @@ env/
 catboost_info/
 
 # ---- Exported reports (regenerated on demand from the app/CLI) ----
-reports/*.csv
-reports/*.png
+reports/
+
+# ---- Runtime state ----
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
 
 # ---- OS junk ----
 .DS_Store
@@ -31,4 +38,11 @@ Thumbs.db
 
 
 
+# Student records, raw source datasets, and generated risk tables can contain
+# sensitive data. Keep local data out of Git unless a sanitized fixture is
+# deliberately added in a separate, reviewed change.
 data/*
+
+# A duplicate checkout is kept locally for reference; the root frontend is the
+# source served by Compose.
+frontend/AI-Powered-Student-Risk-Intervention-System-main/

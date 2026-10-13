@@ -56,6 +56,8 @@ class InterventionResponse(BaseModel):
     # REAL student ID
     student_id: str
 
+    display_student_id: str | None = None
+
     # 1-based dataframe row index
     row_index: int | None = None
 
@@ -109,6 +111,11 @@ class BatchInterventionRequest(BaseModel):
         le=50,
     )
 
+    offset: int = Field(
+        default=0,
+        ge=0,
+    )
+
 
 # ============================================================
 # Batch Intervention Response
@@ -121,6 +128,12 @@ class BatchInterventionResponse(BaseModel):
     """
 
     run_id: str
+
+    offset: int = 0
+
+    limit: int = 5
+
+    total_students: int = 0
 
     results: list[
         InterventionResponse
@@ -234,11 +247,16 @@ class ChatRequest(BaseModel):
 
     provider
         Optional LLM provider.
+
+    page_context
+        Optional description of the frontend page currently being viewed.
     """
 
     question: str
 
     session_id: str | None = None
+
+    teacher_id: str | None = None
 
     history: list[
         ChatMessageIn
@@ -247,6 +265,10 @@ class ChatRequest(BaseModel):
     )
 
     provider: str | None = None
+
+    page_context: str | None = None
+
+    chart_gallery: dict[str, str] = Field(default_factory=dict, max_length=4)
 
 
 # ============================================================
@@ -271,6 +293,8 @@ class ChatResponse(BaseModel):
     ] = Field(
         default_factory=list
     )
+
+    charts: dict[str, dict] = Field(default_factory=dict)
 
 
 # ============================================================

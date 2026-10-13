@@ -351,36 +351,23 @@ def get_student_shap(
 
 def get_model_information(dataset: Literal["uci", "oulad"]) -> dict:
     """
-    Return the trained model name and its real test-set metrics.
-
-    The metrics are read directly from the saved model summary rather
-    than being calculated or estimated by the AI assistant. This allows
-    the agent to answer questions about model performance using the
-    actual stored evaluation results.
+    Return the trained model name and held-out metrics at the configured threshold.
     """
-
-    # Validate the dataset
     if dataset not in ("uci", "oulad"):
         raise ValueError(
             f"dataset must be 'uci' or 'oulad', got {dataset!r}"
         )
 
-    # Load the saved model summary
-    summary = risk_queries.load_model_summary(dataset)
-
-    # Return model name and validated metrics
+    performance = risk_queries.get_model_performance(dataset)
     return {
         "dataset": dataset,
-        "model_name": (
-            summary.get("model_class")
-            or summary.get("selected_model")
-            or risk_queries.get_model_class_name(dataset)
-        ),
+        "model_name": performance["model_name"],
+        "threshold_used": performance["threshold_used"],
         "model_metrics": ModelMetrics(
-            precision=summary["test_precision_at_risk"],
-            recall=summary["test_recall_at_risk"],
-            f1=summary["test_f1_at_risk"],
-            roc_auc=summary.get("test_roc_auc"),
+            precision=performance["precision"],
+            recall=performance["recall"],
+            f1=performance["f1"],
+            roc_auc=performance["roc_auc"],
         ).model_dump(),
     }
 
@@ -731,6 +718,9 @@ def get_student_engagement(id_student: int) -> dict:
         ),
         "engagement_trend_direction": trend_direction,
         "first_significant_decline_week": decline_week,
+        "_weekly_chart_data": weekly[
+            ["week_number", "total_clicks", "days_active"]
+        ].to_dict(orient="records"),
     }
 
 

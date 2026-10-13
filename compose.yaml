@@ -1,0 +1,118 @@
+x-python-app: &python-app
+  image: student-risk-intervention:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-student_analytics}:${POSTGRES_PASSWORD:-local-dev-postgres-only}@postgres:5432/${POSTGRES_DB:-student_analytics}
+    PGUSER: ${POSTGRES_USER:-student_analytics}
+    PGPASSWORD: ${POSTGRES_PASSWORD:-local-dev-postgres-only}
+    PGDATABASE: ${POSTGRES_DB:-student_analytics}
+    PGHOST: postgres
+    PGPORT: 5432
+    SQLITE_DB_PATH: /data/interventions.db
+    DB_HOST: mysql
+    DB_PORT: 3306
+    DB_USER: student_analytics
+    DB_PASSWORD: ${MYSQL_PASSWORD:-local-dev-mysql-only}
+    DB_NAME: ${DB_NAME:-student_analytics}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - intervention-data:/data
+    - app-logs:/app/logs
+    - app-reports:/app/reports
+    - huggingface-cache:/home/app/.cache/huggingface
+    - ./data/raw:/app/data/raw:ro
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-student_analytics}
+      POSTGRES_USER: ${POSTGRES_USER:-student_analytics}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-postgres-only}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-student_analytics}
+      MYSQL_USER: student_analytics
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-local-dev-mysql-only}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-dev-mysql-root-only}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  api:
+    <<: *python-app
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  streamlit:
+    <<: *python-app
+    command:
+      ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    ports:
+      - "${STREAMLIT_PORT:-8502}:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+
+  web:
+    image: nginx:alpine
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    volumes:
+      - ./frontend/index.html:/usr/share/nginx/html/index.html:ro
+      - ./frontend/assets:/usr/share/nginx/html/assets:ro
+      - ./frontend/css:/usr/share/nginx/html/css:ro
+      - ./frontend/js:/usr/share/nginx/html/js:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  intervention-data:
+  app-logs:
+  app-reports:
+  postgres-data:
+  mysql-data:
+  huggingface-cache:

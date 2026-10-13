@@ -666,12 +666,12 @@ def page_risk_model_performance_uci(conn):
     if not require_risk_artifacts("uci"):
         return
 
-    summary = rs.load_model_summary("uci")
+    performance = risk_queries.get_model_performance("uci")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Precision (at-risk)", f"{summary['test_precision_at_risk']:.3f}")
-    c2.metric("Recall (at-risk)", f"{summary['test_recall_at_risk']:.3f}")
-    c3.metric("F1 (at-risk)", f"{summary['test_f1_at_risk']:.3f}")
-    c4.metric("ROC-AUC", f"{summary['test_roc_auc']:.3f}")
+    c1.metric("Precision (at-risk)", f"{performance['precision']:.3f}")
+    c2.metric("Recall (at-risk)", f"{performance['recall']:.3f}")
+    c3.metric("F1 (at-risk)", f"{performance['f1']:.3f}")
+    c4.metric("ROC-AUC", f"{performance['roc_auc']:.3f}")
     st.caption(f"Model: {rs.get_model_class_name('uci')}  ·  threshold = {rs.RISK_THRESHOLD_UCI:.3f}")
 
     model = rs.load_model("uci")
@@ -693,12 +693,12 @@ def page_risk_model_performance_oulad(conn):
     if not require_risk_artifacts("oulad"):
         return
 
-    summary = rs.load_model_summary("oulad")
+    performance = risk_queries.get_model_performance("oulad")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Precision (at-risk)", f"{summary['test_precision_at_risk']:.3f}")
-    c2.metric("Recall (at-risk)", f"{summary['test_recall_at_risk']:.3f}")
-    c3.metric("F1 (at-risk)", f"{summary['test_f1_at_risk']:.3f}")
-    c4.metric("ROC-AUC", f"{summary['test_roc_auc']:.3f}")
+    c1.metric("Precision (at-risk)", f"{performance['precision']:.3f}")
+    c2.metric("Recall (at-risk)", f"{performance['recall']:.3f}")
+    c3.metric("F1 (at-risk)", f"{performance['f1']:.3f}")
+    c4.metric("ROC-AUC", f"{performance['roc_auc']:.3f}")
     st.caption(f"Model: {rs.get_model_class_name('oulad')}  ·  threshold = {rs.RISK_THRESHOLD_OULAD:.3f}")
 
     model = rs.load_model("oulad")

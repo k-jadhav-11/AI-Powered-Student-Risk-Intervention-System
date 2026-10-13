@@ -74,9 +74,16 @@ def build_pivot_table(marks_df: pd.DataFrame) -> pd.DataFrame:
     if marks_df.empty:
         return pd.DataFrame()
 
+    index_cols = (
+        ["student_id", "student_name"]
+        if "student_id" in marks_df.columns and "student_name" in marks_df.columns
+        else ["student_id"]
+        if "student_id" in marks_df.columns
+        else ["student_name"]
+    )
     pivot = pd.pivot_table(
         marks_df,
-        index="student_name",
+        index=index_cols,
         columns="subject",
         values="score",
         aggfunc="mean",
@@ -135,13 +142,12 @@ def find_subject_strengths(pivot_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     numeric_pivot = pivot_df.astype(float)
-    return pd.DataFrame({
-        "student_name": numeric_pivot.index,
-        "strongest_subject": numeric_pivot.idxmax(axis=1).values,
-        "strongest_score": numeric_pivot.max(axis=1).values,
-        "weakest_subject": numeric_pivot.idxmin(axis=1).values,
-        "weakest_score": numeric_pivot.min(axis=1).values,
-    }).reset_index(drop=True)
+    result = numeric_pivot.index.to_frame(index=False)
+    result["strongest_subject"] = numeric_pivot.idxmax(axis=1).to_numpy()
+    result["strongest_score"] = numeric_pivot.max(axis=1).to_numpy()
+    result["weakest_subject"] = numeric_pivot.idxmin(axis=1).to_numpy()
+    result["weakest_score"] = numeric_pivot.min(axis=1).to_numpy()
+    return result
 
 
 def compute_improvement_by_student(scores_df: pd.DataFrame) -> pd.DataFrame:
@@ -155,19 +161,29 @@ def compute_improvement_by_student(scores_df: pd.DataFrame) -> pd.DataFrame:
 
     df = scores_df.copy()
     df["test_date"] = pd.to_datetime(df["test_date"])
-    per_test = df.groupby(["student_name", "test_date"])["score"].mean().reset_index()
+    identity_cols = ["student_id"] if "student_id" in df.columns else ["student_name"]
+    per_test = df.groupby(identity_cols + ["test_date"])["score"].mean().reset_index()
 
     rows = []
-    for name, group in per_test.groupby("student_name"):
+    for identity, group in per_test.groupby(identity_cols):
+        if not isinstance(identity, tuple):
+            identity = (identity,)
         group = group.sort_values("test_date")
         first_score = float(group["score"].iloc[0])
         last_score = float(group["score"].iloc[-1])
-        rows.append({
-            "student_name": name,
+        row = {
+            column: value for column, value in zip(identity_cols, identity)
+        }
+        if "student_id" in identity_cols and "student_name" in df.columns:
+            row["student_name"] = df.loc[
+                df["student_id"] == row["student_id"], "student_name"
+            ].iloc[0]
+        row.update({
             "first_score": round(first_score, 2),
             "last_score": round(last_score, 2),
             "improvement": round(last_score - first_score, 2),
         })
+        rows.append(row)
     return pd.DataFrame(rows).sort_values("improvement", ascending=False).reset_index(drop=True)
 
 
@@ -191,10 +207,14 @@ def compute_consistency_by_student(scores_df: pd.DataFrame) -> pd.DataFrame:
     if scores_df.empty:
         return pd.DataFrame(columns=["student_name", "average_score", "consistency_std"])
 
-    grouped = scores_df.groupby("student_name")["score"].agg(
+    identity_cols = ["student_id"] if "student_id" in scores_df.columns else ["student_name"]
+    grouped = scores_df.groupby(identity_cols)["score"].agg(
         average_score="mean",
         consistency_std=lambda s: np.std(s.values, ddof=0),
     ).reset_index()
+    if "student_id" in identity_cols and "student_name" in scores_df.columns:
+        names = scores_df[["student_id", "student_name"]].drop_duplicates("student_id")
+        grouped = grouped.merge(names, on="student_id", how="left", validate="one_to_one")
     grouped["average_score"] = grouped["average_score"].round(2)
     grouped["consistency_std"] = grouped["consistency_std"].round(2)
     return grouped.sort_values("consistency_std").reset_index(drop=True)

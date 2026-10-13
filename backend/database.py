@@ -17,9 +17,9 @@ load_dotenv()
 # Database configuration
 # ============================================================
 
-SQLITE_FALLBACK_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "interventions.db",
+SQLITE_FALLBACK_PATH = os.environ.get(
+    "SQLITE_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "interventions.db"),
 )
 
 DATABASE_URL = (

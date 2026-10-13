@@ -13,12 +13,25 @@ This tests the AGENT'S LOGIC, not whether a real LLM picks good tool calls
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from ai_assistant import agent, llm_client
 from src.risk import model_gru
+import pandas as pd
+import base64
+
+
+@pytest.fixture(autouse=True)
+def reset_agent_model_cache():
+    agent._TOOLS_CACHE = None
+    agent._MODEL_CACHE.clear()
+    yield
+    agent._TOOLS_CACHE = None
+    agent._MODEL_CACHE.clear()
 
 
 class FakeChatModel:
@@ -90,13 +103,13 @@ def test_run_agent_multi_round_tool_calling(monkeypatch):
     multiple sequential tool calls before a final answer."""
     monkeypatch.setattr(llm_client, "is_configured", lambda provider=None: True)
     fake = FakeChatModel([
-        _tool_call_message("get_student_risk", {"dataset": "uci", "student_id": "0"}, "call_1"),
-        _tool_call_message("get_student_shap", {"dataset": "uci", "student_id": "0"}, "call_2"),
-        _final_message("Student 0 is High risk because of failures and grades."),
+        _tool_call_message("get_student_risk", {"dataset": "uci", "student_id": "1"}, "call_1"),
+        _tool_call_message("get_student_shap", {"dataset": "uci", "student_id": "1"}, "call_2"),
+        _final_message("Student 1 is High risk because of failures and grades."),
     ])
     monkeypatch.setattr(llm_client, "get_chat_model", lambda provider=None: fake)
 
-    result = agent.run_agent("why is student 0 at risk", {})
+    result = agent.run_agent("why is student 1 at risk", {})
     assert result["tool_calls_made"] == ["get_student_risk", "get_student_shap"]
     assert "High risk" in result["answer"]
 
@@ -170,13 +183,60 @@ def test_get_gru_context_tool_populates_artifacts(monkeypatch):
     assert result["artifacts"].gru_student_id == str(sid)
 
 
-def test_build_tools_returns_all_eight_tools():
-    artifacts = agent.AgentArtifacts()
-    tools = agent.build_tools(artifacts)
+def test_student_engagement_tool_populates_timeline_chart_artifact(monkeypatch):
+    monkeypatch.setattr(llm_client, "is_configured", lambda provider=None: True)
+    sid = 6516
+    weekly = [
+        {"week_number": 0, "total_clicks": 12, "days_active": 2},
+        {"week_number": 1, "total_clicks": 18, "days_active": 3},
+    ]
+    monkeypatch.setattr(
+        agent.ai_tools,
+        "get_student_engagement",
+        lambda _sid: {
+            "student_id": str(sid),
+            "num_weeks_active": 2,
+            "_weekly_chart_data": weekly,
+        },
+    )
+    monkeypatch.setattr(
+        model_gru,
+        "load_gru_model",
+        lambda _dataset: ("model", {"max_weeks": 40}),
+    )
+    trajectory = pd.DataFrame([
+        {"week_number": 0, "risk_score": 0.72, "at_risk": True},
+        {"week_number": 1, "risk_score": 0.31, "at_risk": False},
+    ])
+    monkeypatch.setattr(
+        model_gru,
+        "compute_gru_risk_trajectory",
+        lambda _model, _cfg, _weekly: (trajectory, 0),
+    )
+    fake = FakeChatModel([
+        _tool_call_message("get_student_engagement", {"id_student": sid}),
+        _final_message("Engagement is increasing."),
+    ])
+    monkeypatch.setattr(llm_client, "get_chat_model", lambda provider=None: fake)
+
+    result = agent.run_agent(f"how is student {sid} doing over time", {})
+
+    assert result["tool_calls_made"] == ["get_student_engagement"]
+    chart = result["artifacts"].chart_payload()["gru_timeseries"]
+    assert chart["student_id"] == str(sid)
+    assert chart["weekly_engagement"] == weekly
+    assert chart["risk_trajectory"][0]["risk_score"] == 0.72
+    assert base64.b64decode(chart["image_png_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
+    assert result["answer"] == "Engagement is increasing."
+
+
+def test_build_tools_returns_all_nine_tools():
+    tools = agent.build_tools()
     names = {t.name for t in tools}
     assert names == {
         "get_student_risk", "get_student_shap", "get_model_information", "search_interventions",
         "get_cohort_summary", "get_student_engagement", "get_student_gru_explanation", "get_gru_context",
+        "run_intervention_agent",
     }
 
 
@@ -193,6 +253,7 @@ def test_agent_artifacts_fresh_per_run_no_leakage(monkeypatch):
     assert result1["artifacts"].gru_weekly_df is not None
 
     fake2 = FakeChatModel([_final_message("a general answer, no tool needed")])
+    agent._MODEL_CACHE.clear()
     monkeypatch.setattr(llm_client, "get_chat_model", lambda provider=None: fake2)
     result2 = agent.run_agent("what is SHAP", {})
     assert result2["artifacts"].gru_weekly_df is None  # fresh instance, no leakage from result1
@@ -201,12 +262,12 @@ def test_agent_artifacts_fresh_per_run_no_leakage(monkeypatch):
 def test_streaming_agent_yields_full_answer(monkeypatch):
     monkeypatch.setattr(llm_client, "is_configured", lambda provider=None: True)
     fake = FakeChatModel([
-        _tool_call_message("get_student_risk", {"dataset": "uci", "student_id": "0"}),
-        _final_message("Student 0 is High risk."),
+        _tool_call_message("get_student_risk", {"dataset": "uci", "student_id": "1"}),
+        _final_message("Student 1 is High risk."),
     ])
     monkeypatch.setattr(llm_client, "get_chat_model", lambda provider=None: fake)
 
     result = agent._StreamResult()
     chunks = list(agent.run_agent_stream_with_artifacts("test question", {}, result))
-    assert "".join(chunks) == "Student 0 is High risk."
+    assert "".join(chunks) == "Student 1 is High risk."
     assert result.tool_calls_made == ["get_student_risk"]

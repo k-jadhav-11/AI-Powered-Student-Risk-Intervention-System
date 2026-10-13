@@ -57,3 +57,51 @@ def test_build_single_record_raises_on_missing_field():
     incomplete = {col: 0 for col in risk_queries.UCI_FEATURE_COLUMNS[:-1]}  # drop the last one
     with pytest.raises(ValueError):
         risk_queries.build_single_record(incomplete, risk_queries.UCI_FEATURE_COLUMNS)
+
+
+def test_load_persona_student_ids_uses_aligned_uci_risk_scores(monkeypatch, tmp_path):
+    personas = pd.DataFrame({
+        "actual_at_risk": [0, 1],
+        "risk_score": [0.1, 0.9],
+    })
+    risk_scores = pd.DataFrame({
+        "actual_at_risk": [0, 1],
+        "risk_score": [0.1, 0.9],
+        "display_student_id": ["UCI-0001", "UCI-0002"],
+    })
+    features = pd.DataFrame({"at_risk": [0, 1]})
+    monkeypatch.setattr(risk_queries, "load_personas", lambda _dataset: personas)
+    monkeypatch.setattr(risk_queries, "load_risk_scores", lambda _dataset: risk_scores)
+    monkeypatch.setattr(risk_queries, "load_feature_matrix", lambda _dataset: features)
+
+    identifiers = risk_queries.load_persona_student_ids("uci")
+
+    assert identifiers["row_index"].tolist() == [1, 2]
+    assert identifiers["display_student_id"].tolist() == ["UCI-0001", "UCI-0002"]
+
+
+def test_load_persona_student_ids_uses_oulad_row_lookup(monkeypatch, tmp_path):
+    personas = pd.DataFrame({"actual_at_risk": [0, 1]})
+    features = pd.DataFrame({"at_risk": [0, 1]})
+    pd.DataFrame({"id_student": [6516, 8462]}).to_csv(
+        tmp_path / "oulad_student_ids.csv", index=False
+    )
+    monkeypatch.setattr(risk_queries, "PROCESSED_DIR", str(tmp_path))
+    monkeypatch.setattr(risk_queries, "load_personas", lambda _dataset: personas)
+    monkeypatch.setattr(risk_queries, "load_feature_matrix", lambda _dataset: features)
+
+    identifiers = risk_queries.load_persona_student_ids("oulad")
+
+    assert identifiers["row_index"].tolist() == [1, 2]
+    assert identifiers["id_student"].tolist() == [6516, 8462]
+    assert identifiers["display_student_id"].tolist() == ["6516", "8462"]
+
+
+def test_load_persona_student_ids_rejects_misaligned_rows(monkeypatch):
+    personas = pd.DataFrame({"actual_at_risk": [1, 0]})
+    features = pd.DataFrame({"at_risk": [0, 1]})
+    monkeypatch.setattr(risk_queries, "load_personas", lambda _dataset: personas)
+    monkeypatch.setattr(risk_queries, "load_feature_matrix", lambda _dataset: features)
+
+    with pytest.raises(ValueError, match="not aligned"):
+        risk_queries.load_persona_student_ids("uci")
